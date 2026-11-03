@@ -166,6 +166,7 @@ pub const View = struct {
 test {
     _ = @import("tests_motion.zig");
     _ = frame_log;
+    _ = @import("present_slots.zig");
     _ = @import("tests_effects.zig");
     _ = @import("tests_scroll_x.zig");
     _ = @import("tests_a11y_adjust.zig");
