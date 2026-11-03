@@ -62,12 +62,15 @@ pub const Page = struct {
             const yes = objc.msg(objc.Object, objc.class("NSNumber"), "numberWithBool:", .{objc.YES});
             objc.msg(void, prefs, "setValue:forKey:", .{ yes, objc.nsString("developerExtrasEnabled") });
         }
+        if (options.configure) |f| f(options.configure_ctx, @ptrCast(config));
 
-        const content_view = objc.msg(objc.Object, window.nswindow, "contentView", .{});
-        const bounds = objc.msg(objc.CGRect, content_view, "bounds", .{});
+        // Docked: in the app's view, placed by `setFrame`; else the window's.
+        const docked: ?objc.Object = if (options.parent) |p| @ptrCast(p) else null;
+        const content_view = docked orelse objc.msg(objc.Object, window.nswindow, "contentView", .{});
+        const bounds: objc.CGRect = if (docked != null) .{} else objc.msg(objc.CGRect, content_view, "bounds", .{});
         const webview = objc.msg(objc.Object, objc.msg(objc.Object, webview_class, "alloc", .{}), "initWithFrame:configuration:", .{ bounds, config });
         objc.setZig(webview, self);
-        objc.msg(void, webview, "setAutoresizingMask:", .{@as(objc.NSUInteger, 2 | 16)}); // width | height sizable
+        if (docked == null) objc.msg(void, webview, "setAutoresizingMask:", .{@as(objc.NSUInteger, 2 | 16)}); // width | height sizable
         if (options.inspectable and objc.msg(objc.BOOL, webview, "respondsToSelector:", .{objc.sel("setInspectable:")}))
             objc.msg(void, webview, "setInspectable:", .{objc.YES});
         // The web view is not the content view: WebKit docks the inspector in its superview.
@@ -151,6 +154,19 @@ pub const Page = struct {
     pub fn load(self: *Page, url: []const u8) void {
         self.loadUrl(url);
     }
+
+    /// Places a docked page in its parent view (points, the parent's
+    /// coordinates). Call from the surface's `after_frame` with the box's
+    /// laid-out rect, returning true, so the move presents with the frame.
+    pub fn setFrame(self: *Page, x: f64, y: f64, w: f64, h: f64) void {
+        objc.msg(void, self.webview, "setFrame:", .{objc.CGRect{ .origin = .{ .x = x, .y = y }, .size = .{ .width = w, .height = h } }});
+    }
+
+    /// Queues an encoded message for this page (any thread: main only here).
+    pub fn sendOwned(self: *Page, msg: []u8) void {
+        defer self.queue.gpa.free(msg);
+        self.enqueue(msg, true);
+    }
 };
 
 var stackBuf: [2048]u8 = undefined;
@@ -175,7 +191,8 @@ fn didReceiveScriptMessage(self_obj: objc.Object, _: objc.SEL, _: objc.Object, m
     const pool = objc.Pool.push();
     defer pool.pop();
     const body = objc.msg(objc.Object, message, "body", .{});
-    ipc.handleMessage(self.queue.window, objc.fromNSString(body));
+    // The page that sent it, which need not be the window's `page`.
+    ipc.handlePageMessage(self.queue.window, self, objc.fromNSString(body));
 }
 
 fn startURLSchemeTask(self_obj: objc.Object, _: objc.SEL, _: objc.Object, task: objc.Object) callconv(.c) void {
