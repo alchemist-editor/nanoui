@@ -144,6 +144,13 @@ pub fn ipc(comptime Window: type, comptime App: type) type {
                 std.log.warn("nanoui: malformed message from page", .{});
                 return;
             };
+            // A method may close `window` (freeing it) and its page: only
+            // `page` is used after `callMethod`, and it outlives this call.
+            page.queue.dispatching = true;
+            defer {
+                page.queue.dispatching = false;
+                if (page.queue.dead and !page.queue.flush_scheduled) page.queue.gpa.destroy(page);
+            }
             if (std.mem.eql(u8, env.t, "call")) {
                 var aw: std.Io.Writer.Allocating = .init(a);
                 aw.writer.print("{{\"t\":\"reply\",\"id\":{d},", .{pageId(env.id)}) catch return;
