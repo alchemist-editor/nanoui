@@ -64,6 +64,7 @@ pub const Surface = struct {
     /// frame (output, an animation) gets the resize's next one.
     resizing: bool = false,
     cursor: ctx_mod.Cursor = .arrow,
+    custom_cursor: ?*anyopaque = null,
     cursor_dirty: bool = false,
     theme_override: ?Theme = null,
     cached_theme: Theme = Theme.light,
@@ -532,15 +533,20 @@ pub const Surface = struct {
             return;
         }
         const want: ctx_mod.Cursor = self.ctx.cursor orelse if (self.ctx.cursor_text) .text else if (self.ctx.cursor_hand) .hand else .arrow;
-        if (want == self.cursor and !self.cursor_dirty) return;
+        const custom = if (want == .custom) self.ctx.custom_cursor else null;
+        if (want == self.cursor and custom == self.custom_cursor and !self.cursor_dirty) return;
         self.cursor = want;
+        self.custom_cursor = custom;
         self.cursor_dirty = false;
         self.applyCursor();
     }
 
     pub fn applyCursor(self: *Surface) void {
+        if (self.cursor == .custom) if (self.custom_cursor) |cur| {
+            return objc.msg(void, @as(objc.Object, @ptrCast(cur)), "set", .{});
+        };
         const name: [:0]const u8 = switch (self.cursor) {
-            .arrow => "arrowCursor",
+            .arrow, .custom => "arrowCursor",
             .hand => "pointingHandCursor",
             .text => "IBeamCursor",
             .resize_left_right => "resizeLeftRightCursor",
