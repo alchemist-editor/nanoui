@@ -47,6 +47,10 @@ pub const TitleBar = enum {
     default,
     /// Content under a transparent title bar; the traffic lights stay.
     hidden,
+    /// As `hidden`, with a tall band (`ui.Context.title_bar_height`, 52 pt
+    /// unless the view sets it) the traffic lights are centered in: the
+    /// unified-toolbar look of editors. macOS; `hidden` elsewhere.
+    hidden_tall,
     /// No frame at all: a panel with rounded corners and a shadow, above
     /// other windows, that takes keys without bringing its app forward and
     /// hides when it loses them (a menu bar extra's popover). macOS.

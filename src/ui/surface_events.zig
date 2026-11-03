@@ -119,7 +119,7 @@ fn press(obj: objc.Object, event: objc.Object, button: input.Button) void {
     s.ctx.input.button = eff_button;
     if (eff_button == .left) {
         // Under a hidden title bar, the top strip moves the window as a title bar would.
-        if (s.window.title_bar == .hidden and s.ctx.input.mouse.y < s.ctx.title_bar_height and s.ctx.hot == 0) {
+        if ((s.window.title_bar == .hidden or s.window.title_bar == .hidden_tall) and s.ctx.input.mouse.y < s.ctx.title_bar_height and s.ctx.hot == 0) {
             if (s.ctx.input.click_count == 2) s.window.zoom() else objc.msg(void, s.window.nswindow, "performWindowDragWithEvent:", .{event});
             return;
         }

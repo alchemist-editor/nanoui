@@ -42,9 +42,10 @@ pub const Window = struct {
         errdefer app.gpa.destroy(self);
 
         const popover = options.title_bar == .popover;
+        const hidden = options.title_bar == .hidden or options.title_bar == .hidden_tall;
         var style: objc.NSUInteger = 1 | 2 | 4; // titled, closable, miniaturizable
         if (options.resizable) style |= 8;
-        if (options.title_bar == .hidden) style |= 1 << 15; // full size content view
+        if (hidden) style |= 1 << 15; // full size content view
         if (popover) style = 1 << 7; // borderless, non-activating panel
         if (options.non_activating) style |= 1 << 7;
         if (options.kind == .panel and options.utility and !popover) style |= 1 << 4; // NSWindowStyleMaskUtilityWindow
@@ -77,9 +78,16 @@ pub const Window = struct {
         objc.msg(void, nswindow, "setReleasedWhenClosed:", .{objc.NO});
         objc.msg(void, nswindow, "setTitle:", .{objc.nsString(options.title)});
         objc.msg(void, nswindow, "setContentMinSize:", .{objc.CGSize{ .width = options.min_width, .height = options.min_height }});
-        if (options.title_bar == .hidden and !borderless) {
+        if (hidden and !borderless) {
             objc.msg(void, nswindow, "setTitlebarAppearsTransparent:", .{objc.YES});
             objc.msg(void, nswindow, "setTitleVisibility:", .{@as(objc.NSInteger, 1)});
+        }
+        if (options.title_bar == .hidden_tall and !borderless) {
+            const tb = objc.msg(objc.Object, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("nanoui.tall")});
+            objc.msg(void, nswindow, "setToolbar:", .{tb});
+            objc.release(tb);
+            objc.msg(void, nswindow, "setToolbarStyle:", .{@as(objc.NSInteger, 1)}); // unified
+            objc.msg(void, nswindow, "setTitlebarSeparatorStyle:", .{@as(objc.NSInteger, 1)}); // none
         }
 
         const delegate_class = objc.defineClass(.{
@@ -115,6 +123,7 @@ pub const Window = struct {
             .should_close = options.should_close,
         };
 
+        if (options.title_bar == .hidden_tall) self.centerTrafficLights(52);
         switch (options.content) {
             .page => |p| self.page = try Page.create(self, p),
             .view => |v| self.surface = try Surface.create(self, v, options.theme),
@@ -174,6 +183,24 @@ pub const Window = struct {
 
     pub fn minimize(self: *Window) void {
         objc.msg(void, self.nswindow, "miniaturize:", .{@as(?objc.Object, null)});
+    }
+
+    /// Centers the close, miniaturize and zoom buttons in a band `band` pt
+    /// tall (`TitleBar.hidden_tall`). AppKit lays them out again on resize.
+    pub fn centerTrafficLights(self: *Window, band: f64) void {
+        if (self.isFullScreen()) return;
+        const h = objc.msg(objc.CGRect, self.nswindow, "frame", .{}).size.height;
+        var kind: objc.NSUInteger = 0;
+        while (kind < 3) : (kind += 1) {
+            const btn = objc.msg(?objc.Object, self.nswindow, "standardWindowButton:", .{kind}) orelse continue;
+            const sup = objc.msg(?objc.Object, btn, "superview", .{}) orelse continue;
+            const r = objc.msg(objc.CGRect, btn, "convertRect:toView:", .{ objc.msg(objc.CGRect, btn, "bounds", .{}), @as(?objc.Object, null) });
+            const delta = (h - band / 2) - (r.origin.y + r.size.height / 2);
+            if (@abs(delta) < 0.25) continue;
+            var f = objc.msg(objc.CGRect, btn, "frame", .{});
+            f.origin.y += if (objc.msg(objc.BOOL, sup, "isFlipped", .{})) -delta else delta;
+            objc.msg(void, btn, "setFrameOrigin:", .{f.origin});
+        }
     }
 
     pub fn zoom(self: *Window) void {
@@ -390,6 +417,8 @@ fn screenChanged(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c
 
 fn didResize(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c) void {
     const w = objc.getZig(Window, self_obj) orelse return;
+    // AppKit lays the title bar out again on every resize.
+    if (w.title_bar == .hidden_tall) w.centerTrafficLights(if (w.surface) |s| s.ctx.title_bar_height else 52);
     if (w.on_resize) |cb| cb.func(cb.ctx, w);
 }
 
