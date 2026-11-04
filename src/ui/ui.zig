@@ -87,6 +87,9 @@ pub fn setFontSmoothing(on: bool) void {
 pub fn setInlinePredictions(on: bool) void {
     if (comptime @import("builtin").os.tag == .macos) @import("textinput.zig").inline_predictions = on;
 }
+/// Holds the menu bar's key equivalents back while a view captures key
+/// combinations (a shortcut editor): ⌘ chords reach the view instead.
+pub const suspendMenuKeyEquivalents = keys.suspendMenuKeyEquivalents;
 /// Dockable panels: a tree of splits and tabbed groups (`dock.zig`), drawn
 /// with draggable dividers and tabs (`dock_view.zig`).
 pub const dock = struct {
@@ -104,6 +107,8 @@ pub const dock = struct {
     pub const GroupItem = lay.GroupItem;
     pub const DividerItem = lay.DividerItem;
     pub const zoneRect = lay.zoneRect;
+    pub const soloLayout = lay.soloLayout;
+    pub const drag_threshold = v.drag_threshold;
     pub const Style = v.Style;
     pub const State = v.State;
     pub const TabState = v.TabState;
@@ -218,6 +223,9 @@ test {
     _ = @import("dock.zig");
     _ = @import("dock_layout.zig");
     _ = @import("tests_dock.zig");
+    _ = @import("tests_dock_hooks.zig");
+    _ = @import("tests_tester_verbs.zig");
+    _ = @import("tester_script.zig");
     _ = @import("tests_gradient.zig");
     _ = @import("layout.zig");
     _ = textfield;
