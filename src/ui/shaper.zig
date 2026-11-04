@@ -110,27 +110,23 @@ pub const Table = struct {
         return p;
     }
 
-    /// Lays out `s` as CoreText would, writing its glyphs, pen positions
-    /// and `width`; false when `s` needs CoreText itself.
-    // Not `?f32`: zorg's self-hosted aarch64 backend read that answer's null
-    // flag in `TextSystem.shapeFast` from a stack slot it never wrote, so
-    // every declined run (any non-ASCII text) drew as nothing.
-    pub fn layout(t: *Table, gpa: std.mem.Allocator, s: []const u8, glyphs: []u16, xs: []f32, width: *f32) bool {
+    /// Lays out `s` as CoreText would, writing its glyphs and pen
+    /// positions; null when `s` needs CoreText itself.
+    pub fn layout(t: *Table, gpa: std.mem.Allocator, s: []const u8, glyphs: []u16, xs: []f32) ?f32 {
         var x: f32 = 0;
         for (s, 0..) |c, i| {
-            if (c < first or c >= 0x7f) return false;
-            const ci = t.char(c) orelse return false;
+            if (c < first or c >= 0x7f) return null;
+            const ci = t.char(c) orelse return null;
             if (i > 0) {
-                const p = t.pair(gpa, s[i - 1], c) orelse return false;
-                if (p.complex) return false;
+                const p = t.pair(gpa, s[i - 1], c) orelse return null;
+                if (p.complex) return null;
                 x += p.kern;
             }
             glyphs[i] = t.glyph[ci];
             xs[i] = x;
             x += t.advance[ci];
         }
-        width.* = x;
-        return true;
+        return x;
     }
 };
 
@@ -145,8 +141,7 @@ test "the fast path places glyphs as CoreText does" {
     for (samples) |s| {
         var g: [64]u16 = undefined;
         var xs: [64]f32 = undefined;
-        var w: f32 = 0;
-        if (!t.layout(gpa, s, &g, &xs, &w)) continue; // a ligature: CoreText's own
+        const w = t.layout(gpa, s, &g, &xs) orelse continue; // a ligature: CoreText's own
         compared += 1;
         const attr = cf.attributed(s, @ptrCast(nsfont));
         defer cf.CFRelease(attr);
