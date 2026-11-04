@@ -258,7 +258,7 @@ fn scrollWheel(obj: objc.Object, _: objc.SEL, event: objc.Object) callconv(.c) v
     // and up the scrolling box under the pointer, else a view that takes it.
     const took = dy != 0 and s.ctx.applyScroll(0);
     if (took) s.scroll.add(dy, cf.CACurrentMediaTime());
-    const wheel = s.ctx.wants_wheel and !took;
+    const wheel = (s.ctx.wants_wheel or s.ctx.wheelAt()) and !took;
     const release_over = !s.ctx.scroll_holding and s.ctx.hasOverscroll();
     if (!took and dx == 0 and !wheel and !release_over) return;
     if (s.visible()) {

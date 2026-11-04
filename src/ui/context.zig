@@ -523,6 +523,7 @@ pub const Context = struct {
     pub const commitHits = hooks.commitHits;
     pub const updateHot = hooks.updateHot;
     pub const applyScroll = scroll_mod.applyScroll;
+    pub const wheelAt = scroll_mod.wheelAt;
     pub const hasOverscroll = scroll_mod.hasOverscroll;
 
     pub fn pointerUp(c: *Context) void {

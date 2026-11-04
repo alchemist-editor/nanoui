@@ -46,6 +46,19 @@ pub fn scrollMoved(c: *Context, id: u64) bool {
 }
 
 /// Scrolls the innermost scrolling box under the pointer.
+/// Whether the topmost scrolling box under the pointer reads the wheel
+/// itself (`Style.wheel`): it gets the wheel's vertical deltas in
+/// `input.scroll`, as a view that sets `wants_wheel` does.
+pub fn wheelAt(c: *const Context) bool {
+    var i = c.hits.items.len;
+    while (i > 0) {
+        i -= 1;
+        const h = c.hits.items[i];
+        if (h.scroll and h.rect.contains(c.input.mouse)) return h.wheel;
+    }
+    return false;
+}
+
 pub fn applyScroll(c: *Context, dy: f32) bool {
     var i = c.hits.items.len;
     while (i > 0) {
