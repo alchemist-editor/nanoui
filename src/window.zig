@@ -16,6 +16,8 @@ pub const Callback = window_types.Callback(Window);
 pub const ShouldClose = window_types.ShouldClose(Window);
 pub const Options = window_types.Options(Window);
 pub const NativeView = window_types.NativeView;
+pub const Level = window_types.Level;
+const screen_list = @import("screens.zig");
 
 pub const Window = struct {
     app: *App,
@@ -28,6 +30,7 @@ pub const Window = struct {
     title_bar: TitleBar = .default,
     on_close: ?Callback = null,
     on_resize: ?Callback = null,
+    on_move: ?Callback = null,
     on_fullscreen: ?Callback = null,
     on_key: ?Callback = null,
     should_close: ?ShouldClose = null,
@@ -98,6 +101,7 @@ pub const Window = struct {
                 .{ .name = "windowDidChangeOcclusionState:", .imp = &occlusionChanged, .types = "v@:@" },
                 .{ .name = "windowDidChangeScreen:", .imp = &screenChanged, .types = "v@:@" },
                 .{ .name = "windowDidResize:", .imp = &didResize, .types = "v@:@" },
+                .{ .name = "windowDidMove:", .imp = &didMove, .types = "v@:@" },
                 .{ .name = "windowWillEnterFullScreen:", .imp = &willFullScreen, .types = "v@:@" },
                 .{ .name = "windowDidEnterFullScreen:", .imp = &fullScreenChanged, .types = "v@:@" },
                 .{ .name = "windowWillExitFullScreen:", .imp = &willFullScreen, .types = "v@:@" },
@@ -118,6 +122,7 @@ pub const Window = struct {
             .title_bar = options.title_bar,
             .on_close = options.on_close,
             .on_resize = options.on_resize,
+            .on_move = options.on_move,
             .on_fullscreen = options.on_fullscreen,
             .on_key = options.on_key,
             .should_close = options.should_close,
@@ -144,13 +149,20 @@ pub const Window = struct {
             }
         }
 
-        if (options.x != null and options.y != null) self.setPosition(options.x.?, options.y.?) else objc.msg(void, nswindow, "center", .{});
+        if (options.screen) |id| if (screen_list.byId(id)) |sc| {
+            // On that screen: from its top left, else centered on it.
+            const x = sc.frame.x + (options.x orelse @max(0, (sc.frame.width - options.width) / 2));
+            const y = sc.frame.y + (options.y orelse @max(0, (sc.frame.height - options.height) / 2));
+            self.setPosition(x, y);
+        } else self.placeDefault(options) else self.placeDefault(options);
         if (options.frame_autosave) |name| {
             // A frame kept under the name wins over the one asked for.
             _ = objc.msg(objc.BOOL, nswindow, "setFrameUsingName:", .{objc.nsString(name)});
             _ = objc.msg(objc.BOOL, nswindow, "setFrameAutosaveName:", .{objc.nsString(name)});
         }
         if (options.always_on_top or options.floating) self.setAlwaysOnTop(true);
+        if (options.level) |lv| self.setLevel(lv);
+        if (options.ignores_mouse) self.setIgnoresMouse(true);
         if (options.kind == .panel and !popover and !options.hides_on_deactivate)
             objc.msg(void, nswindow, "setHidesOnDeactivate:", .{objc.NO});
         if (options.opacity < 1) self.setOpacity(options.opacity);
@@ -265,6 +277,40 @@ pub const Window = struct {
     /// Keeps the window above other apps' windows.
     pub fn setAlwaysOnTop(self: *Window, on: bool) void {
         objc.msg(void, self.nswindow, "setLevel:", .{@as(objc.NSInteger, if (on) 3 else 0)}); // NSFloatingWindowLevel
+    }
+
+    fn placeDefault(self: *Window, options: Options) void {
+        if (options.x != null and options.y != null) self.setPosition(options.x.?, options.y.?) else objc.msg(void, self.nswindow, "center", .{});
+    }
+
+    /// Stacks the window at `level` (above the menu bar at `.status`).
+    pub fn setLevel(self: *Window, lv: Level) void {
+        objc.msg(void, self.nswindow, "setLevel:", .{@as(objc.NSInteger, @backingInt(lv))});
+    }
+
+    pub fn level(self: *Window) Level {
+        return @fromBackingInt(@intCast(@as(i32, @intCast(objc.msg(objc.NSInteger, self.nswindow, "level", .{})))));
+    }
+
+    /// Lets clicks and the pointer through to what is behind the window.
+    pub fn setIgnoresMouse(self: *Window, on: bool) void {
+        objc.msg(void, self.nswindow, "setIgnoresMouseEvents:", .{on});
+    }
+
+    /// Moves and sizes the window's frame (points from the primary
+    /// screen's top left, as `frame` reads it): a borderless window over a
+    /// whole screen is `setFrame(screen.frame)`.
+    pub fn setFrame(self: *Window, f: Frame) void {
+        const r: objc.CGRect = .{ .origin = .{ .x = f.x, .y = primaryHeight() - f.y - f.height }, .size = .{ .width = f.width, .height = f.height } };
+        objc.msg(void, self.nswindow, "setFrame:display:animate:", .{ r, objc.YES, objc.NO });
+    }
+
+    /// The screen the window is mostly on (`App.screens`' id), if any.
+    pub fn screenId(self: *Window) ?u32 {
+        const sc = objc.msg(?objc.Object, self.nswindow, "screen", .{}) orelse return null;
+        const desc = objc.msg(objc.Object, sc, "deviceDescription", .{});
+        const num = objc.msg(?objc.Object, desc, "objectForKey:", .{objc.nsString("NSScreenNumber")}) orelse return null;
+        return objc.msg(c_uint, num, "unsignedIntValue", .{});
     }
 
     /// The window's opacity, 0 to 1 (NSWindow's alpha value).
@@ -438,6 +484,11 @@ fn didResize(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c) vo
     // AppKit lays the title bar out again on every resize.
     if (w.title_bar == .hidden_tall) w.centerTrafficLights(if (w.surface) |s| s.ctx.title_bar_height else 52);
     if (w.on_resize) |cb| cb.func(cb.ctx, w);
+}
+
+fn didMove(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c) void {
+    const w = objc.getZig(Window, self_obj) orelse return;
+    if (w.on_move) |cb| cb.func(cb.ctx, w);
 }
 
 fn willFullScreen(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c) void {

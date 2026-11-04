@@ -27,7 +27,17 @@ pub const Options = struct {
     on_continue_activity: ?*const fn (ctx: ?*anyopaque, url: []const u8) void = null,
     /// The app became active (true) or stopped being active.
     on_active: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
+    /// The Dock icon, as PNG bytes: a bare executable (a dev build, no
+    /// bundle) shows it instead of the generic one. Not when hidden.
+    icon_png: ?[]const u8 = null,
+    /// What the About panel (the menu's `.about` role, `showAbout`) shows.
+    about: extras.About = .{},
 };
+
+const extras = @import("app_extras.zig");
+pub const About = extras.About;
+pub const Presentation = extras.Presentation;
+pub const Screen = @import("screens.zig").Screen;
 
 pub const App = struct {
     gpa: std.mem.Allocator,
@@ -101,6 +111,8 @@ pub const App = struct {
                 .{ .name = "application:continueUserActivity:restorationHandler:", .imp = &continueActivity, .types = "c@:@@@?" },
                 .{ .name = "applicationDidBecomeActive:", .imp = &becameActive, .types = "v@:@" },
                 .{ .name = "applicationDidResignActive:", .imp = &resignedActive, .types = "v@:@" },
+                // The menu's About (`menu.zig`'s `.about` role).
+                .{ .name = "nanouiAbout:", .imp = &aboutAction, .types = "v@:@" },
             },
         });
         const delegate = objc.msg(objc.Object, delegate_class, "new", .{});
@@ -122,7 +134,36 @@ pub const App = struct {
         _ = objc.msg(objc.BOOL, nsapp, "setActivationPolicy:", .{policy});
         objc.msg(void, nsapp, "setDelegate:", .{delegate});
         try self.setMenu(&default_menu);
+        if (options.icon_png) |png| if (!flags.hidden) extras.setIcon(nsapp, png);
         return self;
+    }
+
+    /// Every connected screen, the primary first (`screens.zig`).
+    pub fn screens(_: *const App, out: []Screen) []Screen {
+        return @import("screens.zig").list(out);
+    }
+
+    /// The standard About panel, with `Options.about`'s name, version and icon.
+    pub fn showAbout(self: *App) void {
+        extras.showAbout(self.nsapp, self.options.about, self.options.name, self.options.icon_png);
+    }
+
+    /// Adds a file to the system's recent documents (Open Recent, the
+    /// Dock icon's menu).
+    pub fn addRecentDocument(_: *App, path: []const u8) void {
+        extras.addRecentDocument(path);
+    }
+
+    pub fn clearRecentDocuments(_: *App) void {
+        extras.clearRecentDocuments();
+    }
+
+    /// Hides the menu bar and the Dock (or lets them come back at the
+    /// screen's edge) while the app is active: a full-screen view over a
+    /// whole screen. `.{}` puts them back. Not when hidden.
+    pub fn setPresentationOptions(self: *App, p: Presentation) void {
+        if (self.flags.hidden) return;
+        objc.msg(void, self.nsapp, "setPresentationOptions:", .{p.mask()});
     }
 
     pub fn destroy(self: *App) void {
@@ -400,6 +441,11 @@ fn becameActive(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c)
     const app = objc.getZig(App, self_obj) orelse return;
     app.quiet = false;
     if (app.options.on_active) |f| f(app.options.ctx, true);
+}
+
+fn aboutAction(self_obj: objc.Object, _: objc.SEL, _: ?objc.Object) callconv(.c) void {
+    const app = objc.getZig(App, self_obj) orelse return;
+    app.showAbout();
 }
 
 fn resignedActive(self_obj: objc.Object, _: objc.SEL, _: objc.Object) callconv(.c) void {

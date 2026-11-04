@@ -102,6 +102,14 @@ pub const AppOptions = plat.app.Options;
 pub const Window = plat.window.Window;
 pub const WindowOptions = plat.window.Options;
 pub const PageOptions = plat.window.PageOptions;
+/// How high a window stacks (`WindowOptions.level`, `Window.setLevel`).
+pub const WindowLevel = @import("window_types.zig").Level;
+/// A connected screen (`App.screens`), the About panel's options
+/// (`AppOptions.about`) and what full screen hides
+/// (`App.setPresentationOptions`): macOS.
+pub const Screen = if (mac) @import("screens.zig").Screen else void;
+pub const About = if (mac) @import("app_extras.zig").About else void;
+pub const Presentation = if (mac) @import("app_extras.zig").Presentation else void;
 /// A page docked in a native-UI window (`Window.dockPage`), macOS.
 pub const Page = if (mac) @import("page_webkit.zig").Page else void;
 pub const Asset = plat.window.Asset;
@@ -210,4 +218,7 @@ test {
     _ = @import("tests_window.zig");
     // Windows opened while running and closed by the app, keys, wakes.
     _ = @import("tests_window_more.zig");
+    // Screens, the About panel's options, recent documents.
+    _ = @import("screens.zig");
+    _ = @import("app_extras.zig");
 }
