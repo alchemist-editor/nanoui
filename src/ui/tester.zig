@@ -277,6 +277,13 @@ pub const Tester = struct {
         t.click(r.x + r.w / 2, r.y + r.h / 2);
     }
 
+    /// Runs the real event loop for `seconds` (replies, timers, work posted
+    /// to the main queue from other threads), then a frame.
+    pub fn pump(t: *Tester, seconds: f64) void {
+        runFor(seconds);
+        t.frame();
+    }
+
     /// Renders the last frame offscreen and writes it to a PNG file.
     pub fn screenshot(t: *Tester, path: []const u8) !void {
         const pixels = try t.render(t.gpa);
