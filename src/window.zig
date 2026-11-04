@@ -331,6 +331,13 @@ pub const Window = struct {
         if (self.surface) |s| s.requestFrame();
     }
 
+    /// `redraw` from any thread (a decoder's): lock-free, coalesced, drawn
+    /// at the display's next refresh. Only while the window is open: stop
+    /// the thread before closing it.
+    pub fn redrawFromAnyThread(self: *Window) void {
+        if (self.surface) |s| s.requestFrameFromAnyThread();
+    }
+
     /// A web page docked in `options.parent`, an NSView of this window
     /// (a native-UI window's region): its own bridge, the app's services,
     /// freed with the window. Place it with `Page.setFrame`.
