@@ -8,6 +8,7 @@ pub const shapes = @import("raster_shapes.zig");
 const types = @import("types.zig");
 const gpu = @import("gpu.zig");
 const glass = @import("glass.zig");
+const pic = @import("raster_picture.zig");
 
 /// The glyph atlas, as the shader samples it: one byte per texel.
 pub const Mask = struct {
@@ -21,8 +22,11 @@ pub const Mask = struct {
 pub const Pictures = struct {
     pixels: []const u8 = &.{},
     size: u32 = 0,
-    /// The frame's textures (`ui.texture`): their `bgra` is drawn.
+    /// The frame's textures (`ui.texture`): their `bgra` is drawn, or
+    /// their pixel buffer's planes made display sRGB (`texture_cpu.zig`).
     textures: []const gpu.Texture = &.{},
+    /// The frame's gradients of many stops (`Context.gradients`).
+    gradients: []const [4]f32 = &.{},
 };
 
 /// Draws `instances` over `clear` into `out` (sized `out.width` ×
@@ -194,7 +198,7 @@ fn drawGroup(out: gpu.Pixels, span: []const gpu.Instance, begin_inst: *const gpu
 fn unit(v: f32) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
 }
-inline fn unrotate(i: *const gpu.Instance, wx: f32, wy: f32) [2]f32 {
+pub inline fn unrotate(i: *const gpu.Instance, wx: f32, wy: f32) [2]f32 {
     const a = i.xf[0];
     if (a == 0) return .{ wx, wy };
     const dx = wx - i.xf[2];
@@ -256,16 +260,16 @@ fn drawOne(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, pictures: Pictur
     const b: [4]usize = .{ @max(all[0], region[0]), @max(all[1], region[1]), @min(all[2], region[2]), @min(all[3], region[3]) };
     if (b[2] <= b[0] or b[3] <= b[1]) return;
     if (i.kind == gpu.Kind.text) return glyph(out, i, mask, scale, b);
-    if (i.kind == gpu.Kind.image) return picture(out, i, .atlas(pictures), scale, b);
+    if (i.kind == gpu.Kind.image) return pic.picture(out, i, .atlas(pictures), scale, b);
     if (i.kind == gpu.Kind.texture) {
         const slot: usize = @intFromFloat(i.border_width);
-        if (slot < pictures.textures.len) picture(out, i, .texture(pictures.textures[slot]), scale, b);
+        if (slot < pictures.textures.len) pic.texture(out, i, pictures.textures[slot], scale, b);
         return;
     }
     if (i.kind == gpu.Kind.shadow or i.kind == gpu.Kind.shadow_out) return shadow(out, i, scale, b);
     if (i.kind == gpu.Kind.glass) return pane(out, i, scale, b);
     if (i.kind == gpu.Kind.segment or i.kind == gpu.Kind.triangle or i.kind == gpu.Kind.hole) return shapes.draw(out, i, scale, b);
-    quad(out, i, scale, b);
+    quad(out, i, pictures.gradients, scale, b);
 }
 
 /// Blends a premultiplied color over the pixel at byte `at`.
@@ -358,7 +362,7 @@ fn mixColor(a: [4]f32, b: [4]f32, t_in: f32) [4]f32 {
     return .{ a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t };
 }
 
-fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
+fn quad(out: gpu.Pixels, i: *const gpu.Instance, gradients: []const [4]f32, scale: f32, b: [4]usize) void {
     const hw = i.rect[2] * 0.5;
     const hh = i.rect[3] * 0.5;
     const cx = i.rect[0] + hw;
@@ -367,7 +371,9 @@ fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
     const r: f32 = if (i.radius < 0) -r_abs else r_abs;
     const bw = i.border_width;
     const has_border = bw > 0 and i.border_color[3] > 0;
-    const grad = i.uv[1] > 0.5;
+    // A gradient of many stops (uv's y 2), or of two (1).
+    const stops = i.uv[1] > 1.5;
+    const grad = i.uv[1] > 0.5 and !stops;
     const bottom = if (grad) gpu.gradientBottom(i.uv) else i.color;
     var c = i.color;
     const bc = i.border_color;
@@ -381,11 +387,13 @@ fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
         const row = y * out.width * 4;
         const inner_y = !rot and @abs(wy - cy) < hh - solid;
         if (grad and !rot) c = mixColor(i.color, bottom, (wy - i.rect[1]) / @max(i.rect[3], 1e-4));
+        if (stops and !rot) c = gpu.gradientAt(gradients, i.uv, wy - i.rect[1]);
         for (b[0]..b[2]) |x| {
             const wx = (@as(f32, @floatFromInt(x)) + 0.5) * inv;
             const u = unrotate(i, wx, wy);
             if (rot and (u[0] < i.rect[0] or u[1] < i.rect[1] or u[0] > i.rect[0] + i.rect[2] or u[1] > i.rect[1] + i.rect[3])) continue;
             if (grad and rot) c = mixColor(i.color, bottom, (u[1] - i.rect[1]) / @max(i.rect[3], 1e-4));
+            if (stops and rot) c = gpu.gradientAt(gradients, i.uv, u[1] - i.rect[1]);
             const pxl = u[0] - cx;
             const py = u[1] - cy;
             const cut = clipCover(i, wx, wy, inv);
@@ -482,76 +490,6 @@ fn glyph(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, scale: f32, b: [4]
             }
             const a = sample(mask, u, v) * opacity;
             blend(out.bytes, row + x * 4, c[0] * a, c[1] * a, c[2] * a, a);
-        }
-    }
-}
-
-/// A BGRA texel of the image atlas, bilinear as Metal's sampler.
-/// Pixels to sample: the image atlas, or a texture's rows.
-const Source = struct {
-    pixels: []const u8,
-    w: usize,
-    h: usize,
-    stride: usize,
-
-    fn atlas(p: Pictures) Source {
-        return .{ .pixels = p.pixels, .w = p.size, .h = p.size, .stride = @as(usize, p.size) * 4 };
-    }
-
-    fn texture(t: gpu.Texture) Source {
-        return .{ .pixels = t.bgra, .w = t.width, .h = t.height, .stride = if (t.stride > 0) t.stride else @as(usize, t.width) * 4 };
-    }
-};
-
-fn samplePicture(p: Source, u: f32, v: f32) [4]f32 {
-    const fx = u * @as(f32, @floatFromInt(p.w)) - 0.5;
-    const fy = v * @as(f32, @floatFromInt(p.h)) - 0.5;
-    const x0f = @floor(fx);
-    const y0f = @floor(fy);
-    const tx = fx - x0f;
-    const ty = fy - y0f;
-    const mx: i64 = @as(i64, @intCast(p.w)) - 1;
-    const my: i64 = @as(i64, @intCast(p.h)) - 1;
-    const xs = [2]usize{ @intCast(std.math.clamp(@as(i64, @intFromFloat(x0f)), 0, mx)), @intCast(std.math.clamp(@as(i64, @intFromFloat(x0f)) + 1, 0, mx)) };
-    const ys = [2]usize{ @intCast(std.math.clamp(@as(i64, @intFromFloat(y0f)), 0, my)), @intCast(std.math.clamp(@as(i64, @intFromFloat(y0f)) + 1, 0, my)) };
-    var out: [4]f32 = .{ 0, 0, 0, 0 };
-    const weights = [4]f32{ (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty };
-    for (0..4) |k| {
-        const t = p.pixels[ys[k / 2] * p.stride + xs[k % 2] * 4 ..][0..4];
-        for (0..4) |ch| out[ch] += @as(f32, @floatFromInt(t[ch])) / 255 * weights[k];
-    }
-    return out;
-}
-
-fn picture(out: gpu.Pixels, i: *const gpu.Instance, p: Source, scale: f32, b: [4]usize) void {
-    if (p.w == 0 or p.h == 0 or p.pixels.len < p.stride * p.h) return;
-    const inv = 1 / scale;
-    const hw = i.rect[2] * 0.5;
-    const hh = i.rect[3] * 0.5;
-    const r_abs = @min(@abs(i.radius), @min(hw, hh));
-    const r: f32 = if (i.radius < 0) -r_abs else r_abs;
-    const rot = i.xf[0] != 0;
-    for (b[1]..b[3]) |y| {
-        const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
-        const row = y * out.width * 4;
-        for (b[0]..b[2]) |x| {
-            const wx = (@as(f32, @floatFromInt(x)) + 0.5) * inv;
-            const up = unrotate(i, wx, wy);
-            if (rot and (up[0] < i.rect[0] or up[1] < i.rect[1] or up[0] > i.rect[0] + i.rect[2] or up[1] > i.rect[1] + i.rect[3])) continue;
-            const tx = (up[0] - i.rect[0]) / i.rect[2];
-            const ty = (up[1] - i.rect[1]) / i.rect[3];
-            const v = i.uv[1] + (i.uv[3] - i.uv[1]) * ty;
-            const sd = cornerSdf(up[0] - i.rect[0] - hw, up[1] - i.rect[1] - hh, hw, hh, r);
-            const aa = @max(sd[1] * inv, 0.0001) * 0.5;
-            const k = (1 - smoothstep(-aa, aa, sd[0])) * i.color[3] * clipCover(i, wx, wy, inv);
-            if (k <= 0) continue;
-            const t = samplePicture(p, i.uv[0] + (i.uv[2] - i.uv[0]) * tx, v);
-            if (i.border_color[3] > 0) {
-                const a = t[3] * i.border_color[3] * k;
-                blend(out.bytes, row + x * 4, i.border_color[0] * a, i.border_color[1] * a, i.border_color[2] * a, a);
-                continue;
-            }
-            blend(out.bytes, row + x * 4, t[2] * k, t[1] * k, t[0] * k, t[3] * k);
         }
     }
 }
