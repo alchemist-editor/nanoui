@@ -113,6 +113,9 @@ pub const dock = struct {
     pub const State = v.State;
     pub const TabState = v.TabState;
     pub const view = v.view;
+    pub const ExternalDrag = v.ExternalDrag;
+    pub const externalTarget = v.externalTarget;
+    pub const dropExternal = v.dropExternal;
 };
 
 pub const key = widgets.key;
@@ -195,6 +198,26 @@ pub const textArea = @import("textarea.zig").textArea;
 pub const AreaOptions = @import("textarea.zig").AreaOptions;
 /// Focuses the field built next (`c.focusNext`), selecting all its text if asked.
 pub const focusNext = @import("context_hooks.zig").focusNext;
+/// A drag inside the window carrying the app's value from box to box,
+/// across panels (`drag_payload.zig`): `dragSource` on the box it starts
+/// from, `dragOver`/`dropTarget` on where it may land.
+pub const dragSource = @import("drag_payload.zig").dragSource;
+pub const dragOver = @import("drag_payload.zig").dragOver;
+pub const dropTarget = @import("drag_payload.zig").dropTarget;
+pub const dragging = @import("drag_payload.zig").dragging;
+pub const cancelDrag = @import("drag_payload.zig").cancel;
+pub const DragSource = @import("drag_payload.zig").Source;
+pub const DragActive = @import("drag_payload.zig").Active;
+/// Rich text from a little Markdown (`markdown.zig`): bold, italic,
+/// code, headings and bullets as spans.
+pub const markdown = @import("markdown.zig");
+/// A scroll box's offset read back and set (`scroll_x.zig`).
+pub const scrollBox = @import("scroll_x.zig").scrollBox;
+pub const scrollOffset = @import("scroll_x.zig").scrollOffset;
+pub const setScrollOffset = @import("scroll_x.zig").setScrollOffset;
+pub const scrollMax = @import("scroll_x.zig").scrollMax;
+pub const scrollAtEnd = @import("scroll_x.zig").atEnd;
+pub const scrollToEnd = @import("scroll_x.zig").scrollToEnd;
 /// What a drop from another app brought (`Context.dropAt`).
 pub const Drop = @import("input.zig").Drop;
 pub const MouseButton = @import("input.zig").Button;
@@ -242,6 +265,14 @@ test {
     _ = @import("panes.zig");
     _ = @import("dock.zig");
     _ = @import("dock_layout.zig");
+    _ = @import("dock_resize.zig");
+    _ = @import("tests_dock_external.zig");
+    _ = @import("drag_payload.zig");
+    _ = @import("tests_drag_payload.zig");
+    _ = @import("markdown.zig");
+    _ = @import("tests_scroll_api.zig");
+    _ = @import("tests_multi_surface.zig");
+    _ = @import("tests_autofocus.zig");
     _ = @import("tests_dock.zig");
     _ = @import("tests_dock_hooks.zig");
     _ = @import("tests_tester_verbs.zig");

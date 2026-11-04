@@ -69,7 +69,9 @@ src/nanoui.zig        the public API
 src/objc.zig          Objective-C runtime, runtime classes, blocks, libdispatch
 src/app.zig           lifecycle, menu bar, trays, services, client generation
 src/dev.zig           --nanoui-* flags: generate, snapshot, script, eval, hidden
-src/window.zig        NSWindow showing a page or native UI, window controls
+src/app_extras.zig    the About panel's options, the Dock icon, recent documents, presentation options
+src/screens.zig       the Mac's screens: ids, frames, scales, names (App.screens)
+src/window.zig        NSWindow showing a page or native UI, window controls, level, placement
 src/page.zig          the page's platform-free part: the outbox, held messages, the asset table
 src/page_webkit.zig   WKWebView: the view, the scheme handler, the message handler
 src/page_webview2.zig WebView2: the view, the resource filter, the message handler
@@ -93,6 +95,9 @@ src/ui/frame.zig      one frame, shared by windows and the Tester; frame stats
 src/ui/widgets.zig    boxes, text, icons, buttons, toggles, sliders, …
 src/ui/div.zig        GPUI-style elements: ui.div(c).row().gap(8)…
 src/ui/list.zig       virtualized list (GPUI's uniform_list)
+src/ui/dock*.zig      dockable panels: the tree, its layout, resizing by the app, the view, tab drags (also from other windows)
+src/ui/drag_payload.zig  a drag carrying the app's value from box to box (dragSource, dropTarget)
+src/ui/markdown.zig   a little Markdown as rich-text spans
 src/ui/textfield.zig  the text field: selection, composition, clipboard
 src/ui/textinput.zig  NSTextInputClient: IME, key bindings → text ops
 src/ui/text.zig       fonts, shaping, cached layouts, wrapping

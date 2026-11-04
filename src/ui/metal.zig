@@ -86,7 +86,11 @@ pub const Renderer = struct {
     pub fn init() !Renderer {
         const pool = objc.Pool.push();
         defer pool.pop();
-        const device = cf.MTLCreateSystemDefaultDevice() orelse return error.NoMetalDevice;
+        // Every window's and Tester's renderer draws with the one device
+        // (`ui.metalDevice`): an app's texture, a CVPixelBuffer's, made for
+        // one surface draws in any.
+        const shared: objc.Object = @ptrCast(@import("metal_app.zig").metalDevice() orelse return error.NoMetalDevice);
+        const device = objc.retain(shared);
         errdefer objc.release(device);
         const queue = objc.msg(objc.Object, device, "newCommandQueue", .{});
         errdefer objc.release(queue);
