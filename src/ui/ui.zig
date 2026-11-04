@@ -81,6 +81,12 @@ pub const PanesOptions = @import("panes.zig").Options;
 pub fn setFontSmoothing(on: bool) void {
     if (comptime !@import("text.zig").portable) @import("atlas.zig").smoothing_allowed = on;
 }
+/// Whether macOS offers inline predictions (14+) in text fields. They come
+/// as marked text: off, each typed letter is committed as it's typed, as
+/// a search field wants. On by default; no effect elsewhere.
+pub fn setInlinePredictions(on: bool) void {
+    if (comptime @import("builtin").os.tag == .macos) @import("textinput.zig").inline_predictions = on;
+}
 /// Dockable panels: a tree of splits and tabbed groups (`dock.zig`), drawn
 /// with draggable dividers and tabs (`dock_view.zig`).
 pub const dock = struct {
