@@ -200,6 +200,10 @@ pub const Context = struct {
     /// its empty space moves the window, as a title bar does: a view with
     /// a toolbar there makes it the toolbar's height.
     title_bar_height: f32 = 28,
+    /// Where the close button's left edge sits in a `hidden_tall` window,
+    /// in points from the window's left (0: where AppKit puts it): a view
+    /// that draws the traffic lights into its own toolbar moves them in.
+    traffic_lights_x: f32 = 0,
     /// The window's edges the system draws over, in points: on iOS the
     /// status bar, the home indicator, the screen's corners and the
     /// keyboard. Zero on the desktop, and in an iOS window that isn't

@@ -54,6 +54,8 @@ pub const Surface = struct {
     last_present_target: f64 = 0,
     paced: bool = false,
     in_frame: bool = false,
+    /// The band height and inset the traffic lights were last placed for.
+    lights_at: [2]f32 = .{ 0, 0 },
     full_pending: bool = false,
     retained_ready: bool = false,
     frame_in_due: f64 = 0,
@@ -327,6 +329,11 @@ pub const Surface = struct {
         const r = frame_mod.run(c, self.view, &self.text, &self.instances, self.size, self.scale, a11y.themed(self, self.theme()), dt, now - self.start_time);
         if (self.dead) return;
         a11y.afterFrame(self);
+        // The view may have moved the traffic lights' band or inset.
+        if (self.window.title_bar == .hidden_tall and (c.title_bar_height != self.lights_at[0] or c.traffic_lights_x != self.lights_at[1])) {
+            self.lights_at = .{ c.title_bar_height, c.traffic_lights_x };
+            self.window.centerTrafficLights(c.title_bar_height);
+        }
         @import("../play.zig").paint(self.gpa, &self.instances);
         self.frame_in_due = if (c.frame_in) |fi| now + @as(f64, fi) else 0;
         const t_af0 = if (self.frame_log != null) cf.CACurrentMediaTime() else 0;

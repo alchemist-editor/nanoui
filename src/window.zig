@@ -190,15 +190,26 @@ pub const Window = struct {
     pub fn centerTrafficLights(self: *Window, band: f64) void {
         if (self.isFullScreen()) return;
         const h = objc.msg(objc.CGRect, self.nswindow, "frame", .{}).size.height;
+        // Moved along too when the view asks (`ui.Context.traffic_lights_x`):
+        // all three by the close button's distance from where it's wanted.
+        const want_x: f64 = if (self.surface) |s| s.ctx.traffic_lights_x else 0;
+        var dx: f64 = 0;
+        if (want_x > 0) {
+            if (objc.msg(?objc.Object, self.nswindow, "standardWindowButton:", .{@as(objc.NSUInteger, 0)})) |btn0| {
+                const r = objc.msg(objc.CGRect, btn0, "convertRect:toView:", .{ objc.msg(objc.CGRect, btn0, "bounds", .{}), @as(?objc.Object, null) });
+                dx = want_x - r.origin.x;
+            }
+        }
         var kind: objc.NSUInteger = 0;
         while (kind < 3) : (kind += 1) {
             const btn = objc.msg(?objc.Object, self.nswindow, "standardWindowButton:", .{kind}) orelse continue;
             const sup = objc.msg(?objc.Object, btn, "superview", .{}) orelse continue;
             const r = objc.msg(objc.CGRect, btn, "convertRect:toView:", .{ objc.msg(objc.CGRect, btn, "bounds", .{}), @as(?objc.Object, null) });
             const delta = (h - band / 2) - (r.origin.y + r.size.height / 2);
-            if (@abs(delta) < 0.25) continue;
+            if (@abs(delta) < 0.25 and @abs(dx) < 0.25) continue;
             var f = objc.msg(objc.CGRect, btn, "frame", .{});
             f.origin.y += if (objc.msg(objc.BOOL, sup, "isFlipped", .{})) -delta else delta;
+            f.origin.x += dx;
             objc.msg(void, btn, "setFrameOrigin:", .{f.origin});
         }
     }
