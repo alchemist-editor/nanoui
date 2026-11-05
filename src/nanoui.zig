@@ -194,6 +194,8 @@ test {
             _ = @import("windows/tests_surface.zig");
             // The window's own: styles, sizes, the close veto, the timers.
             _ = @import("windows/tests_window.zig");
+            // Frames on the display's beat, gathered input, the frame log.
+            _ = @import("windows/tests_pace.zig");
             // A title bar the app draws, frames kept between launches,
             // the icon, cursors, docked pages and launch URLs.
             _ = @import("windows/chrome.zig");
