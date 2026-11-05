@@ -94,7 +94,9 @@ pub const directions = @import("basics/directions.zig");
 /// Components after GPUI Kit: buttons, overlays, tabs, forms, toasts.
 pub const kit = @import("kit/kit.zig");
 pub const tsgen = @import("tsgen.zig");
-pub const Surface = if (mac) @import("ui/surface.zig").Surface else void;
+/// A native-UI window's surface: macOS's NSView, Windows' HWND client
+/// (`after_frame`, `nativeHandle`, `ctx`).
+pub const Surface = if (mac) @import("ui/surface.zig").Surface else if (builtin.os.tag == .windows) @import("windows/surface.zig").Surface else void;
 pub const a11y = if (mac) @import("ui/a11y.zig") else struct {};
 
 pub const App = plat.app.App;
@@ -110,8 +112,9 @@ pub const WindowLevel = @import("window_types.zig").Level;
 pub const Screen = if (mac) @import("screens.zig").Screen else void;
 pub const About = if (mac) @import("app_extras.zig").About else void;
 pub const Presentation = if (mac) @import("app_extras.zig").Presentation else void;
-/// A page docked in a native-UI window (`Window.dockPage`), macOS.
-pub const Page = if (mac) @import("page_webkit.zig").Page else void;
+/// A page docked in a native-UI window (`Window.dockPage`): WKWebView on
+/// macOS, WebView2 on Windows.
+pub const Page = if (mac) @import("page_webkit.zig").Page else if (builtin.os.tag == .windows) @import("page_webview2.zig").Page else void;
 pub const Asset = plat.window.Asset;
 /// Typed IPC for pages: wherever a webview draws them (macOS, Windows).
 const has_pages = mac or builtin.os.tag == .windows;
@@ -191,6 +194,14 @@ test {
             _ = @import("windows/tests_surface.zig");
             // The window's own: styles, sizes, the close veto, the timers.
             _ = @import("windows/tests_window.zig");
+            // A title bar the app draws, frames kept between launches,
+            // the icon, cursors, docked pages and launch URLs.
+            _ = @import("windows/chrome.zig");
+            _ = @import("windows/window_place.zig");
+            _ = @import("windows/tests_chrome.zig");
+            _ = @import("windows/cursor.zig");
+            _ = @import("page_webview2_dock.zig");
+            _ = @import("windows/app.zig");
             // File drops: path/URL conversion and one HDROP as one event.
             _ = @import("windows/drop_files.zig");
             _ = @import("windows/tests_drop_files.zig");

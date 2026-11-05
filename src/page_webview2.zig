@@ -9,6 +9,8 @@
 const std = @import("std");
 const wv = @import("windows/webview2.zig");
 const profile = @import("page_webview2_profile.zig");
+const serve = @import("page_webview2_serve.zig");
+const dock = @import("page_webview2_dock.zig");
 const page = @import("page.zig");
 const window_mod = @import("windows/window.zig");
 const app_mod = @import("windows/app.zig");
@@ -47,15 +49,25 @@ pub const Page = struct {
     token_resource: i64 = 0,
     token_message: i64 = 0,
     token_nav: i64 = 0,
+    /// Docked in a native-UI window (`Window.dockPage`): placed by the app
+    /// (`setFrame`) rather than covering the client area.
+    docked: bool = false,
+    /// The docked page's bounds in pixels, once `setFrame` placed it.
+    frame_px: ?wv.Rect = null,
+    /// Shown (`show`, `hide`): kept for a controller that is not there yet.
+    shown: bool = true,
 
     pub fn create(window: *Window, options: window_mod.PageOptions) !*Page {
         const gpa = window.app.gpa;
-        const hwnd = window.hwnd orelse return error.NoWindow;
+        // A docked page's parent is the window's own HWND (native UI draws
+        // into it; `PageOptions.parent` names it, or the window does).
+        const hwnd: w.HWND = if (options.parent) |pp| @ptrCast(pp) else window.hwnd orelse return error.NoWindow;
         const self = try gpa.create(Page);
         errdefer gpa.destroy(self);
         self.* = .{
             .queue = page.Queue(Window).init(window, options),
             .hwnd = hwnd,
+            .docked = options.parent != null,
             .data_dir = try profile.userDataDir(window, gpa, window.app.options.name),
         };
         errdefer gpa.free(self.data_dir);
@@ -118,6 +130,9 @@ pub const Page = struct {
     }
 
     pub fn destroy(self: *Page) void {
+        // A docked page leaves the window's list (the app may destroy it
+        // before the window goes).
+        if (self.docked) self.queue.window.undock(self);
         self.queue.deinit();
         // Close the controller first, and give back the reference
         // `controllerReady` took: the view goes with it.
@@ -197,7 +212,7 @@ pub const Page = struct {
             return;
         }
         self.pending_flush = false;
-        window_mod.postFlush(self.hwnd);
+        window_mod.postFlush(self.hwnd, self);
     }
 
     pub fn startDrag(self: *Page) void {
@@ -256,7 +271,7 @@ pub const Page = struct {
         _ = env.addRef();
         self.environment = env;
         if (self.queue.window.app.debug) std.debug.print("nanoui: webview2 environment ready\n", .{});
-        window_mod.postController(self.hwnd);
+        window_mod.postController(self.hwnd, self);
     }
 
     /// Asks for the controller, when the loop reaches `WM_NANOUI_CONTROLLER`.
@@ -306,8 +321,10 @@ pub const Page = struct {
         const v = view orelse return;
         self.webview = v;
 
-        self.applyBounds();
-        _ = wv.Controller.setIsVisible(ctl, 1);
+        if (self.docked) dock.ready(self, ctl) else {
+            self.applyBounds();
+            _ = wv.Controller.setIsVisible(ctl, 1);
+        }
 
         // WebView2's own settings: the inspectable page keeps its menus and
         // developer tools, as WKWebView's does.
@@ -352,12 +369,39 @@ pub const Page = struct {
         self.load(self.queue.options.url);
         if (self.pending_flush) {
             self.pending_flush = false;
-            window_mod.postFlush(self.hwnd);
+            window_mod.postFlush(self.hwnd, self);
         }
     }
 
-    /// The view covers the window's client area.
+    /// Places a docked page (points, the window's client coordinates). Call
+    /// from the surface's `after_frame` with the box's laid-out rect, as on
+    /// macOS.
+    pub fn setFrame(self: *Page, x: f64, y: f64, width: f64, height: f64) void {
+        const r = dock.pixelRect(x, y, width, height, dock.scaleOf(self.hwnd));
+        if (self.frame_px) |old| if (std.meta.eql(old, r)) return;
+        self.frame_px = r;
+        if (self.controller) |c| _ = wv.Controller.setBounds(c, r);
+    }
+
+    /// Shows or hides the page (a docked one's view; the window stays).
+    pub fn setHidden(self: *Page, hidden: bool) void {
+        if (self.shown == !hidden) return;
+        self.shown = !hidden;
+        if (self.controller) |c| _ = wv.Controller.setIsVisible(c, if (self.shown) 1 else 0);
+    }
+
+    pub fn show(self: *Page) void {
+        self.setHidden(false);
+    }
+
+    pub fn hide(self: *Page) void {
+        self.setHidden(true);
+    }
+
+    /// The view covers the window's client area; a docked one keeps the
+    /// frame the app gave it.
     pub fn applyBounds(self: *Page) void {
+        if (self.docked) return;
         const c = self.controller orelse return;
         var rect: w.RECT = undefined;
         if (w.GetClientRect(self.hwnd, &rect) == 0) return;
@@ -529,7 +573,7 @@ const ResourceRequested = struct {
             std.debug.print("nanoui: resource {s} -> {d} {s} ({d} bytes)\n", .{ buf.allocatedSlice()[0..n], served.status, served.mime, served.data.len });
         const env = page_self.environment orelse return wv.S_OK;
         var resp: ?*Com = null;
-        const cr = makeResponse(env, served, gpa, &resp);
+        const cr = serve.makeResponse(env, served, gpa, &resp);
         if (cr < 0 or resp == null) {
             if (cr < 0) std.log.warn("nanoui: CreateWebResourceResponse failed (0x{x})", .{@as(u32, @bitCast(cr))});
             return wv.S_OK;
@@ -540,61 +584,3 @@ const ResourceRequested = struct {
         return wv.S_OK;
     }
 };
-
-/// `env.CreateWebResourceResponse(stream, status, reason, headers)`.
-fn makeResponse(env: *Com, served: page.Served, gpa: std.mem.Allocator, out: *?*Com) HRESULT {
-    const headers = headersZ(gpa, served.mime) orelse return -1;
-    defer gpa.free(headers);
-    var stream: ?*Com = null;
-    if (served.data.len > 0) stream = shMemStream(served.data.ptr, served.data.len);
-    // WebView2 takes the stream: it owns the reference it was given, so the
-    // one made here is not released by us.
-    return wv.Environment.createResponse(env, stream, @intCast(served.status), reasonZ(served.status), headers.ptr, out);
-}
-
-/// An `IStream` over a copy of `bytes`.
-///
-/// `CreateStreamOnHGlobal`: the stream owns the memory (WebView2 reads it
-/// after this returns, and asks its size), so the bytes go into an HGLOBAL
-/// the stream takes.
-fn shMemStream(bytes: [*]const u8, len: usize) ?*Com {
-    const h = w.GlobalAlloc(w.GMEM_MOVEABLE, len) orelse return null;
-    const dest = w.GlobalLock(h) orelse {
-        _ = w.GlobalFree(h);
-        return null;
-    };
-    @memcpy(@as([*]u8, @ptrCast(dest))[0..len], bytes[0..len]);
-    _ = w.GlobalUnlock(h);
-    var stream: ?*Com = null;
-    const hr = CreateStreamOnHGlobal(h, 1, &stream); // fDeleteOnRelease
-    if (hr < 0) {
-        _ = w.GlobalFree(h);
-        return null;
-    }
-    return stream;
-}
-
-extern "ole32" fn CreateStreamOnHGlobal(mem: ?*anyopaque, delete_on_release: i32, out: *?*Com) callconv(.winapi) HRESULT;
-
-/// The reason phrase WebView2 takes, by status.
-fn reasonZ(status: u16) [*:0]const u16 {
-    return switch (status) {
-        200 => std.unicode.utf8ToUtf16LeStringLiteral("OK"),
-        else => std.unicode.utf8ToUtf16LeStringLiteral("Not Found"),
-    };
-}
-
-/// `Content-Type: <mime>\r\nCache-Control: no-cache\r\n`, as WebView2 takes
-/// its headers. `mime` is one of ours or an asset's, so it is built here.
-fn headersZ(gpa: std.mem.Allocator, mime: []const u8) ?[:0]u16 {
-    const text = std.fmt.allocPrint(gpa, "Content-Type: {s}\r\nCache-Control: no-cache\r\n", .{mime}) catch return null;
-    defer gpa.free(text);
-    const n = std.unicode.calcUtf16LeLen(text) catch return null;
-    const buf = gpa.alloc(u16, n + 1) catch return null;
-    _ = std.unicode.utf8ToUtf16Le(buf, text) catch {
-        gpa.free(buf);
-        return null;
-    };
-    buf[n] = 0;
-    return buf[0..n :0];
-}

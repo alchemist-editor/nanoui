@@ -395,6 +395,15 @@ pub const Window = struct {
         return p;
     }
 
+    /// A docked page going away (`Page.destroy`): out of the list the
+    /// window frees with it.
+    pub fn undock(self: *Window, p: *Page) void {
+        for (self.docked.items, 0..) |item, i| if (item == p) {
+            _ = self.docked.swapRemove(i);
+            return;
+        };
+    }
+
     pub fn setTitle(self: *Window, title: []const u8) void {
         const pool = objc.Pool.push();
         defer pool.pop();
@@ -445,7 +454,8 @@ pub const Window = struct {
         self.closed = true;
         if (self.on_close) |cb| cb.func(cb.ctx, self);
         if (self.page) |p| p.destroy();
-        for (self.docked.items) |p| p.destroy();
+        // `destroy` takes each out of the list (`undock`).
+        while (self.docked.pop()) |p| p.destroy();
         self.docked.deinit(self.app.gpa);
         if (self.surface) |s| s.destroy();
         self.page = null;

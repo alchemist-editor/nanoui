@@ -255,11 +255,29 @@ fn layoutNode(t: *const Tree, index: u8, rect: Rect, out: *Layout) void {
         }
         sizes[fill] += left;
     }
-    var cursor = if (node.axis == .row) rect.x else rect.y;
-    const end = cursor + ext;
+    // Whole points: panels' extents land on pixels. What rounding (and a
+    // fractional divider, `Metrics.divider`) leaves goes to the largest
+    // child that can still grow (the last of equals), not to whichever is
+    // last: a strip collapsed to 72 points at the end of a split stays 72,
+    // where it used to come out 71.5.
+    var exts: [max_children]f32 = @splat(0);
+    var slack: usize = n - 1;
+    var widest: f32 = -1;
     for (0..n) |i| {
-        // Whole points: panels' edges land on pixels.
-        const e = if (i + 1 == n) @max(end - cursor, 0) else @round(sizes[i]);
+        exts[i] = @round(sizes[i]);
+        if (sizes[i] + 0.001 < maxs[i] and sizes[i] >= widest) {
+            widest = sizes[i];
+            slack = i;
+        }
+    }
+    var others: f32 = 0;
+    for (0..n) |i| if (i != slack) {
+        others += exts[i];
+    };
+    exts[slack] = @max(avail - others, 0);
+    var cursor = if (node.axis == .row) rect.x else rect.y;
+    for (0..n) |i| {
+        const e = exts[i];
         const r = if (node.axis == .row) Rect{ .x = cursor, .y = rect.y, .w = e, .h = rect.h } else Rect{ .x = rect.x, .y = cursor, .w = rect.w, .h = e };
         layoutNode(t, node.children[i], r, out);
         cursor += e;

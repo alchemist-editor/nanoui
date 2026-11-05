@@ -63,10 +63,10 @@ pub fn adjustDividerFor(t: *Tree, l: *const dl.Layout, panel: dock.PanelId, axis
 
 /// Sets `panel`'s group to `extent` points along `axis` (its height for
 /// `.column`), as near as its and its neighbour's limits let it: the
-/// layout is run again over `l`'s bounds to land on whole points. A
-/// split's last child takes what the others leave, dividers included, so
-/// with a fractional divider (`Metrics.divider`, 4.5) it lands within
-/// half a point. Whether anything changed.
+/// layout is run again over `l`'s bounds to land on whole points. What
+/// rounding and a fractional divider (`Metrics.divider`, 4.5) leave goes
+/// to the split's largest child, so a strip at the end of a split lands on
+/// the extent asked for. Whether anything changed.
 pub fn setGroupExtent(t: *Tree, l: *const dl.Layout, panel: dock.PanelId, axis: Axis, extent: f32) bool {
     if (!std.math.isFinite(extent)) return false;
     const bounds = layoutBounds(l) orelse return false;
@@ -133,7 +133,7 @@ test "setGroupExtent collapses a panel to a 72-point strip and back" {
     try std.testing.expect(t.groupSize(&l, 9) == null);
 }
 
-test "setGroupExtent on a split's last child: from the divider before it, within half a point" {
+test "setGroupExtent on a split's last child: from the divider before it, on whole points" {
     const catalog = [_]dock.PanelInfo{ .{ .title = "Timeline", .min_h = 80 }, .{ .title = "Mixer", .min_h = 40 } };
     var t = Tree.init(&catalog);
     try std.testing.expect(t.insert(0, null));
@@ -142,7 +142,9 @@ test "setGroupExtent on a split's last child: from the divider before it, within
     var l = t.layout(bounds);
     try std.testing.expect(t.setGroupExtent(&l, 1, .column, 72));
     l = t.layout(bounds);
-    try std.testing.expectApproxEqAbs(@as(f32, 72), t.groupSize(&l, 1).?.h, 0.5);
+    // A fractional divider's half point goes to the timeline above it.
+    try std.testing.expectEqual(@as(f32, 72), t.groupSize(&l, 1).?.h);
+    try std.testing.expectEqual(@as(f32, 600), t.groupSize(&l, 0).?.h + t.groupSize(&l, 1).?.h + t.metrics.divider);
     // A divider of whole points: exact.
     t.metrics.divider = 4;
     l = t.layout(bounds);
