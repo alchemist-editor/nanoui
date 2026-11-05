@@ -83,7 +83,7 @@ src/tsgen.zig         comptime TypeScript declarations and JS client
 src/bridge.js         the page runtime (window.nanoui)
 src/menu.zig          menus from templates: roles, accelerators, checkboxes
 src/tray.zig          status bar icons
-src/dialog.zig        open/save panels, message boxes
+src/dialog.zig        open/save panels, message boxes; dialog_filters.zig: named filter groups (the panel's popup)
 src/desktop.zig       clipboard, shell (open, reveal, trash), paths, appearance
 src/update.zig        updates from GitHub releases: check, verify, swap the bundle
 src/ui/ui.zig         native UI's public API and View
@@ -119,7 +119,10 @@ src/ui/atlas_tt.zig   the glyph atlas in memory; icons.zig: line icons
 src/ui/raster.zig     the CPU renderer (same pixels as shader.metal)
 src/ui/canvas.zig     a CPU-drawn window's pixels: only what a frame changed is drawn
 src/ui/opengl.zig     the OpenGL 3.3 renderer (Linux), and OpenGL ES 3's (Android); shader.glsl: both Metal shaders in GLSL
-src/ui/d3d11.zig      the Direct3D 11 renderer (Windows), shader.hlsl; d3d11_texture: ui.texture's slots
+src/ui/d3d11.zig      the Direct3D 11 renderer (Windows), shader.hlsl; d3d11_texture: ui.texture's slots;
+                      d3d11_device: the app's one device (ui.d3d11Device, video support, multithread);
+                      d3d11_video: an app's ID3D11Texture2D (NV12/P010/BGRA) and the colour stage, texture_post.hlsl
+src/ui/frame_pace.zig a display-paced clock's decisions: gathered input, when to stop (Windows' vblank clock)
 src/ui/gl.zig         OpenGL's functions, loaded with dlopen
 src/ui/images.zig     pictures (ui.image): decoded once, packed in a BGRA atlas
 src/ui/png_decode.zig PNG to pixels where ImageIO isn't (Linux, Windows, portable)
@@ -128,6 +131,8 @@ src/linux/            GTK 3 backend: app, window, surface (GL area or CPU), dial
 src/windows/          Win32 backend: app, window, surface (events, frames) +
                       surface_gpu (paint, D3D11 present), d3d (swap chain),
                       ime (IMM32), win32 (the extern layer), desktop, dialog,
+                      vblank (the display's beat: WaitForVBlank on a thread),
+                      surface_pace (frames on it, gathered moves, the frame log),
                       chrome (app-drawn title bars: NCCALCSIZE, NCHITTEST,
                       snap layouts), window_place (geometry, frame_autosave,
                       the icon), cursor (makeCursor), fdwatch, loop, tests_*
