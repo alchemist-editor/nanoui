@@ -19,7 +19,9 @@ pub const OpenOptions = struct {
     directories: bool = false,
     multiple: bool = false,
     /// File name extensions allowed, without dots: `&.{ "png", "jpg" }`.
-    /// Ignored when `filters` names groups.
+    /// Ignored when `filters` names groups. Enforced on every platform:
+    /// Windows' panel used to ignore them and now lists only these files
+    /// (as one unnamed file type), the way macOS always has.
     extensions: []const []const u8 = &.{},
     /// Named groups the user picks between (a popup under the panel on
     /// macOS, the file type list on Windows); the first is shown first.
@@ -34,6 +36,7 @@ pub const SaveOptions = struct {
     directory: []const u8 = "",
     /// The file name the panel starts with.
     name: []const u8 = "",
+    /// As `OpenOptions.extensions`: on Windows too, the only file type.
     extensions: []const []const u8 = &.{},
     /// As `OpenOptions.filters`.
     filters: []const Filter = &.{},
