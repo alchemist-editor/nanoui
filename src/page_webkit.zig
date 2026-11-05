@@ -70,6 +70,10 @@ pub const Page = struct {
         const bounds: objc.CGRect = if (docked != null) .{} else objc.msg(objc.CGRect, content_view, "bounds", .{});
         const webview = objc.msg(objc.Object, objc.msg(objc.Object, webview_class, "alloc", .{}), "initWithFrame:configuration:", .{ bounds, config });
         objc.setZig(webview, self);
+        if (options.transparent) {
+            const no = objc.msg(objc.Object, objc.class("NSNumber"), "numberWithBool:", .{objc.NO});
+            objc.msg(void, webview, "setValue:forKey:", .{ no, objc.nsString("drawsBackground") });
+        }
         if (docked == null) objc.msg(void, webview, "setAutoresizingMask:", .{@as(objc.NSUInteger, 2 | 16)}); // width | height sizable
         if (options.inspectable and objc.msg(objc.BOOL, webview, "respondsToSelector:", .{objc.sel("setInspectable:")}))
             objc.msg(void, webview, "setInspectable:", .{objc.YES});
@@ -83,6 +87,7 @@ pub const Page = struct {
     }
 
     pub fn destroy(self: *Page) void {
+        self.queue.window.undock(self);
         const ucc = objc.msg(objc.Object, objc.msg(objc.Object, self.webview, "configuration", .{}), "userContentController", .{});
         objc.msg(void, ucc, "removeScriptMessageHandlerForName:", .{objc.nsString("nanoui")});
         objc.setZig(self.handler, null);
@@ -163,6 +168,19 @@ pub const Page = struct {
     /// laid-out rect, returning true, so the move presents with the frame.
     pub fn setFrame(self: *Page, x: f64, y: f64, w: f64, h: f64) void {
         objc.msg(void, self.webview, "setFrame:", .{objc.CGRect{ .origin = .{ .x = x, .y = y }, .size = .{ .width = w, .height = h } }});
+    }
+
+    /// Shows or hides the page's view (a docked one's; the window stays).
+    pub fn setHidden(self: *Page, hidden: bool) void {
+        objc.msg(void, self.webview, "setHidden:", .{if (hidden) objc.YES else objc.NO});
+    }
+
+    pub fn show(self: *Page) void {
+        self.setHidden(false);
+    }
+
+    pub fn hide(self: *Page) void {
+        self.setHidden(true);
     }
 
     /// Queues an encoded message for this page (any thread: main only here).

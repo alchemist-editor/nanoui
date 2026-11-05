@@ -22,6 +22,7 @@ const d3d = @import("d3d.zig");
 const d3d11 = @import("../ui/d3d11.zig");
 const gpu_side = @import("surface_gpu.zig");
 const ime = @import("ime.zig");
+const keys = @import("surface_win_keys.zig");
 
 /// Posted for a frame requested from outside the view.
 pub const WM_FRAME = w.WM_APP + 1;
@@ -61,6 +62,8 @@ pub const Surface = struct {
     /// appearance until the view resets it to null.
     theme_chosen: ?Theme = null,
     cursor: ctx_mod.Cursor = .arrow,
+    /// The app's cursor (`ui.makeCursor`) shown with `.custom`.
+    shown_custom: ?*anyopaque = null,
     /// A UTF-16 high surrogate waiting for its other half.
     high: u16 = 0,
     /// The IME's state for this window: a composition running, the guard that
@@ -95,6 +98,12 @@ pub const Surface = struct {
     /// The frames built, and the paints done: the trace's frame number.
     frames: u64 = 0,
     paints: u64 = 0,
+    /// Called after each frame is built, with its layout (`ctx.rects`)
+    /// current: where an app places native views over its boxes (a docked
+    /// page's `setFrame`), as macOS's surface calls it. Its result says
+    /// native views moved; here they move with the window's next paint.
+    after_frame_ctx: ?*anyopaque = null,
+    after_frame: ?*const fn (ctx: ?*anyopaque, s: *Surface) bool = null,
 
     pub fn create(window: *Window, view: ui.View, theme_override: ?Theme) !*Surface {
         const gpa = window.app.gpa;
@@ -135,6 +144,12 @@ pub const Surface = struct {
         return self.window.hwnd;
     }
 
+    /// The native view the surface draws into (its window's HWND): the
+    /// parent a docked page goes in, as macOS's `nsview`.
+    pub fn nativeHandle(self: *Surface) ?*anyopaque {
+        return if (self.window.hwnd) |h| @ptrCast(h) else null;
+    }
+
     /// The theme the frame is drawn with: a window's own when it named one,
     /// else the one the view chose (`c.theme`), else the system's appearance.
     fn theme(self: *Surface) Theme {
@@ -170,6 +185,7 @@ pub const Surface = struct {
             gpu_side.invalidate(self);
             if (!self.frame_again) break;
         }
+        if (self.after_frame) |af| _ = af(self.after_frame_ctx, self);
         self.frames += 1;
         self.trace("frame built: {d:.0}x{d:.0} {d} draws, {d} passes, again={}", .{ self.size.w, self.size.h, self.instances.items.len, passes + 1, self.frame_again });
         self.frame_again = false;
@@ -237,7 +253,14 @@ pub const Surface = struct {
     }
 
     fn updateCursor(self: *Surface) void {
+        const was = self.cursor;
+        const was_custom = self.shown_custom;
         self.cursor = self.ctx.cursor orelse if (self.ctx.cursor_text) .text else if (self.ctx.cursor_hand) .hand else .arrow;
+        self.shown_custom = if (self.cursor == .custom) self.ctx.custom_cursor else null;
+        // A cursor that changed under a pointer that is still over the
+        // client: shown now, not at the next move (WM_SETCURSOR comes
+        // only with one).
+        if ((was != self.cursor or was_custom != self.shown_custom) and self.tracking) self.setCursor();
     }
 
     fn setCursor(self: *Surface) void {
@@ -460,7 +483,7 @@ pub const Surface = struct {
                 // A *system* key is another matter: Alt+F4 and its friends must
                 // keep working, so they go to the default handling.
                 if (self.ime.composing) return if (msg == w.WM_SYSKEYDOWN) null else 0;
-                if (self.keyDown(@intCast(wp))) {
+                if (keys.keyDown(self, @intCast(wp))) {
                     // An arrow key or a delete moved the caret: the IME's windows
                     // follow it, outside `frame` where its callbacks re-enter.
                     if (self.ctx.focused_text != null) ime.follow(h, &self.ctx, self.scale, &self.ime);
@@ -473,110 +496,6 @@ pub const Surface = struct {
             else => if (ime.handle(self, h, msg, wp, lp)) |r| return r else return null,
         }
         return 0;
-    }
-
-    /// Keys that are not text, and key combinations; true if taken.
-    fn keyDown(self: *Surface, vk: u32) bool {
-        const in = &self.ctx.input;
-        const ctrl = w.GetKeyState(0x11) < 0;
-        const alt = w.GetKeyState(0x12) < 0;
-        in.shift = w.GetKeyState(0x10) < 0;
-        in.cmd = false;
-        in.ctrl = ctrl;
-        in.alt = alt;
-        const key: ?ctx_mod.Key = switch (vk) {
-            0x08 => .backspace,
-            0x2E => .delete,
-            0x25 => .left,
-            0x26 => .up,
-            0x27 => .right,
-            0x28 => .down,
-            0x24 => .home,
-            0x23 => .end,
-            0x0D => .enter,
-            0x09 => .tab,
-            0x1B => .escape,
-            0x21 => .page_up,
-            0x22 => .page_down,
-            0x70...0x7B => @fromBackingInt(@intCast(@backingInt(ctx_mod.Key.f1) + (vk - 0x70))),
-            else => null,
-        };
-        const S = ui.Shortcut;
-        const special: ?u21 = if (key) |k| switch (k) {
-            .up => S.up,
-            .down => S.down,
-            .left => S.left,
-            .right => S.right,
-            .tab => S.tab,
-            .escape => S.escape,
-            .enter => S.enter,
-            else => null,
-        } else null;
-        // Letters and digits by their virtual key; other characters come as WM_CHAR.
-        const letter: u21 = if ((vk >= 'A' and vk <= 'Z') or (vk >= '0' and vk <= '9')) std.ascii.toLower(@intCast(vk)) else switch (vk) {
-            0xBC => ',',
-            0xBE => '.',
-            0xBF => '/',
-            0xDB => '[',
-            0xDD => ']',
-            0xDC => '\\',
-            0xBD => '-',
-            0xBB => '=',
-            0x20 => ' ',
-            else => 0,
-        };
-        const base: u21 = special orelse letter;
-        const offer = base != 0 and (ctrl or alt or base == S.up or base == S.down or base == S.tab or base == S.escape);
-        if (offer) {
-            const sc: S = .{ .key = base, .ctrl = ctrl, .alt = alt, .shift = in.shift };
-            if (self.window.app.accelerator(sc)) return true;
-            if (ctrl and self.ctx.focused_text != null and self.editShortcut(base)) return true;
-            self.ctx.shortcut_taken = false;
-            in.shortcut = sc;
-            // Restored, not cleared: building the view can pump messages (the
-            // shell does), and an IME character that arrives inside the pump
-            // sets its own ops — which must not be thrown away with ours.
-            const prev_ops = self.ctx.input.ops;
-            self.frame();
-            self.ctx.input.ops = prev_ops;
-            in.shortcut = null;
-            if (self.ctx.shortcut_taken) return true;
-        }
-        if (key) |k| {
-            in.key = k;
-            self.frame();
-            return true;
-        }
-        return false;
-    }
-
-    /// Ctrl+C, X, V and A in a text field: copy, cut, paste, select all.
-    fn editShortcut(self: *Surface, key: u21) bool {
-        var ops: [1]ctx_mod.TextOp = undefined;
-        var pasted: ?[]u8 = null;
-        defer if (pasted) |p| self.gpa.free(p);
-        ops[0] = switch (key) {
-            'c' => .{ .command = .copy },
-            'x' => .{ .command = .cut },
-            'a' => .{ .command = .select_all },
-            'v' => blk: {
-                pasted = @import("desktop.zig").clipboard.readText(self.gpa) catch null;
-                // No text: the view may take Ctrl+V for something else (an image).
-                const t = pasted orelse return false;
-                for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
-                    ch.* = ' ';
-                };
-                break :blk .{ .insert = t };
-            },
-            else => return false,
-        };
-        // Restored, not cleared, for the same reason as in `keyDown`: a message
-        // pumped during the frame may set ops of its own.
-        const prev_ops = self.ctx.input.ops;
-        self.ctx.input.ops = &ops;
-        self.frame();
-        self.ctx.input.ops = prev_ops;
-        return true;
     }
 };
 
