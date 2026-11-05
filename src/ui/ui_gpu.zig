@@ -29,9 +29,28 @@ pub fn metalDevice() ?*anyopaque {
     return @import("metal_app.zig").metalDevice();
 }
 
+/// The Direct3D 11 device (an ID3D11Device) every window draws and
+/// presents with; null where there's no Direct3D 11. A Media Foundation
+/// decoder is bound to it (`IMFDXGIDeviceManager::ResetDevice`) so its
+/// frames draw as `Texture.d3d11_texture` without leaving the GPU. It is
+/// multithread protected. Made the first time it is asked for, on the main
+/// thread; if the GPU is reset another is made and `d3d11DeviceGeneration`
+/// moves on: bind the decoder again then.
+pub fn d3d11Device() ?*anyopaque {
+    if (comptime builtin.os.tag != .windows) return null;
+    const pair = @import("d3d11_device.zig").shared() orelse return null;
+    return @ptrCast(pair.device);
+}
+
+/// Moves on each time `d3d11Device` is a new device (0 before the first).
+pub fn d3d11DeviceGeneration() u64 {
+    if (comptime builtin.os.tag != .windows) return 0;
+    return @import("d3d11_device.zig").generation();
+}
+
 /// A cursor made from pixels (an NSCursor on macOS, an HCURSOR from
 /// `CreateIconIndirect` on Windows): `rgba` straight alpha, `w` × `h`,
-/// shown at one point a pixel (one pixel a pixel on Windows) with its hot
+/// shown at one point a pixel (on Windows too, made larger at 150% or 200%) with its hot
 /// spot at (`hot_x`, `hot_y`) from its top left. Show it with `setCursor`;
 /// free it with `freeCursor` once nothing shows it. Null where custom
 /// cursors aren't drawn (the arrow stays).
@@ -86,11 +105,18 @@ test "makeCursor makes a cursor from pixels" {
     if (comptime builtin.os.tag == .windows) {
         // An HCURSOR, not an icon, with the hot spot it was given.
         try std.testing.expect(cur != null);
-        const hot = @import("../windows/cursor.zig").hotSpot(cur.?) orelse return error.NotACursor;
-        try std.testing.expectEqual([2]u32{ 8, 8 }, hot);
+        const wc = @import("../windows/cursor.zig");
+        const s = wc.systemScale();
+        const at = struct {
+            fn f(v: f32, k: f32) u32 {
+                return @intFromFloat(@round(if (k > 1.01) v * k else v));
+            }
+        }.f;
+        const hot = wc.hotSpot(cur.?) orelse return error.NotACursor;
+        try std.testing.expectEqual([2]u32{ at(8, s), at(8, s) }, hot);
         const corner = makeCursor(&px, 16, 16, 0, 15);
         defer freeCursor(corner);
-        try std.testing.expectEqual([2]u32{ 0, 15 }, @import("../windows/cursor.zig").hotSpot(corner.?).?);
+        try std.testing.expectEqual([2]u32{ 0, at(15, s) }, wc.hotSpot(corner.?).?);
         try std.testing.expect(makeCursor(px[0..10], 16, 16, 0, 0) == null);
         return;
     }
