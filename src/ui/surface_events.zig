@@ -348,6 +348,7 @@ fn liveResizeStart(obj: objc.Object, _: objc.SEL) callconv(.c) void {
     // frame (`setFrameSize`); held still, the link stops after a moment.
     s.in_live_resize = true;
     s.resize_step_at = cf.CACurrentMediaTime();
+    if (s.resizeSyncEnabled()) s.stopLink();
     s.requestFrame();
 }
 
@@ -355,6 +356,7 @@ fn liveResizeEnd(obj: objc.Object, _: objc.SEL) callconv(.c) void {
     objc.msgSuper(void, obj, objc.class("NSView"), "viewDidEndLiveResize", .{});
     const s = surfaceOf(obj) orelse return;
     s.in_live_resize = false;
+    s.startLink();
     s.requestFrame();
 }
 
@@ -366,6 +368,7 @@ fn setFrameSize(obj: objc.Object, _: objc.SEL, size: objc.CGSize) callconv(.c) v
     // would have no drawable to present.
     if (s.in_live_resize) {
         s.resize_step_at = cf.CACurrentMediaTime();
+        if (s.resizeInTransaction()) return;
         return s.requestFrame();
     }
     s.frame();
