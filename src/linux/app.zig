@@ -132,9 +132,10 @@ pub const App = struct {
     }
 
     /// From any thread: calls `func(ctx)` on the main thread soon (GLib's
-    /// main context takes sources from any thread).
-    pub fn onMain(ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) void {
-        after(0, ctx, func);
+    /// main context takes sources from any thread). False when it never
+    /// will (no GTK, no memory for the source), as on Windows.
+    pub fn onMain(ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) bool {
+        return schedule(0, ctx, func);
     }
 
     /// Files the system asks the app to open: on macOS only; here a file
@@ -143,6 +144,10 @@ pub const App = struct {
 
     /// Calls `func(ctx)` on the main thread after `ms` milliseconds.
     pub fn after(ms: u64, ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) void {
+        _ = schedule(ms, ctx, func);
+    }
+
+    fn schedule(ms: u64, ctx: ?*anyopaque, func: *const fn (?*anyopaque) callconv(.c) void) bool {
         const Timer = struct {
             ctx: ?*anyopaque,
             func: *const fn (?*anyopaque) callconv(.c) void,
@@ -153,10 +158,14 @@ pub const App = struct {
                 return 0;
             }
         };
-        if (!gtk.load()) return;
-        const t = std.heap.c_allocator.create(Timer) catch return;
+        if (!gtk.load()) return false;
+        const t = std.heap.c_allocator.create(Timer) catch return false;
         t.* = .{ .ctx = ctx, .func = func };
-        _ = gtk.api.g_timeout_add(@intCast(ms), Timer.fire, t);
+        if (gtk.api.g_timeout_add(@intCast(ms), Timer.fire, t) == 0) {
+            std.heap.c_allocator.destroy(t);
+            return false;
+        }
+        return true;
     }
 
     pub fn setMenu(self: *App, template: []const menu_mod.MenuItem) !void {
