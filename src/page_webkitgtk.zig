@@ -70,6 +70,8 @@ pub const Page = struct {
     }
 
     pub fn enqueue(self: *Page, msg: []const u8, hold: bool) void {
+        // Closed by the call being answered: nobody is left to read it.
+        if (self.queue.dead) return;
         self.queue.enqueue(msg, hold);
         // One source a turn: only the call that scheduled the flush adds it.
         if (self.queue.schedule()) self.flush_source = gtk.api.g_timeout_add(0, onFlush, self);

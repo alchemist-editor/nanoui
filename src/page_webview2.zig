@@ -171,6 +171,7 @@ pub const Page = struct {
     }
 
     pub fn enqueue(self: *Page, msg: []const u8, hold: bool) void {
+        if (self.queue.dead) return; // closed by the call being answered
         self.queue.enqueue(msg, hold);
         // One post a turn: only the call that scheduled the flush asks for it.
         if (self.queue.schedule()) self.requestFlush();
