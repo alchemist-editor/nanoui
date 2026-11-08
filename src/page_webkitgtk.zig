@@ -57,6 +57,15 @@ pub const Page = struct {
         gtk.api.g_signal_handler_disconnect(self.view, self.crash_signal);
         gtk.api.g_object_unref(self.view);
         self.queue.deinit();
+        // Closed by a call it is still answering: `ipc` frees it when the
+        // call returns (`freeClosed`).
+        if (self.queue.dispatching) return;
+        self.queue.gpa.destroy(self);
+    }
+
+    /// After `destroy`, once the call that closed the page has returned
+    /// (its flush source is already gone).
+    pub fn freeClosed(self: *Page) void {
         self.queue.gpa.destroy(self);
     }
 

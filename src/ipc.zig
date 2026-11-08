@@ -174,6 +174,14 @@ pub fn ipc(comptime Window: type, comptime App: type) type {
         /// or a docked one), on the main thread. `source` is the URL of the
         /// document that posted it, as the webview reports it ("" when it
         /// reports none): what `Call.url` and `Call.origin` say.
+        /// A page its own call closed, freed once the call has returned: as
+        /// its platform frees one (`freeClosed`), or when no flush is left
+        /// to free it (WebKit's flush frees a dead page as it runs).
+        fn freeClosed(page: anytype) void {
+            if (@hasDecl(@TypeOf(page.*), "freeClosed")) return page.freeClosed();
+            if (!page.queue.flush_scheduled) page.queue.gpa.destroy(page);
+        }
+
         pub fn handlePageMessage(window: *Window, page: anytype, body: []const u8, source: []const u8) void {
             const app = window.app;
             var arena: std.heap.ArenaAllocator = .init(app.gpa);
@@ -188,7 +196,7 @@ pub fn ipc(comptime Window: type, comptime App: type) type {
             page.queue.dispatching = true;
             defer {
                 page.queue.dispatching = false;
-                if (page.queue.dead and !page.queue.flush_scheduled) page.queue.gpa.destroy(page);
+                if (page.queue.dead) freeClosed(page);
             }
             if (std.mem.eql(u8, env.t, "call")) {
                 var aw: std.Io.Writer.Allocating = .init(a);

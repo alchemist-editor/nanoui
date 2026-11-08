@@ -153,8 +153,14 @@ pub const Page = struct {
         self.controller = null;
         self.webview = null;
         self.environment = null;
+        // Closed by a call it is still answering: `ipc` frees it when the
+        // call returns (`freeClosed`).
+        if (self.queue.dispatching) return;
         self.freeNow();
     }
+
+    /// After `destroy`, once the call that closed the page has returned.
+    pub const freeClosed = freeNow;
 
     /// Frees the page and its profile path. The handlers need nothing from
     /// it any more: each is alive until WebView2's own references drop.
