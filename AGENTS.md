@@ -2,7 +2,7 @@
 
 nanoui is a desktop application framework in Zig 0.17, after
 [mygo](https://github.com/egoist/mygo). Windows show either a web page in the
-system webview (WKWebView, macOS only for now) with typed Zig ↔ TypeScript
+system webview (WKWebView, WebView2, WebKitGTK) with typed Zig ↔ TypeScript
 IPC, or native UI that nanoui draws itself, in the manner of GPUI: with Metal
 and CoreText on macOS; on Linux (GTK 3, loaded with dlopen) and Windows
 (Win32) with nanoui's own TrueType text (`src/ui/tt/`) and CPU renderer
@@ -72,8 +72,10 @@ src/dev.zig           --nanoui-* flags: generate, snapshot, script, eval, hidden
 src/app_extras.zig    the About panel's options, the Dock icon, recent documents, presentation options
 src/screens.zig       the Mac's screens: ids, frames, scales, names (App.screens)
 src/window.zig        NSWindow showing a page or native UI, window controls, level, placement
+src/window_lights.zig the traffic lights kept where a taller top bar wants them
 src/page.zig          the page's platform-free part: the outbox, held messages, the asset table
 src/page_webkit.zig   WKWebView: the view, the scheme handler, the message handler
+src/page_webkitgtk.zig  WebKitGTK: the view, the scheme handler, the message handler
 src/page_webview2.zig WebView2: the view, the resource filter, the message handler
 src/page_webview2_profile.zig  WebView2's profile folder
 src/windows/webview2.zig  WebView2's COM interfaces, by vtable slot
@@ -115,7 +117,10 @@ src/ui/motion/        ui.motion: springs, tweens, presence, keyframes, layout,
 src/ui/tester.zig     views without a window: input, time, PNG snapshots
 src/ui/tests.zig      widget tests through the Tester
 src/ui/text_tt.zig    text where nanoui shapes it itself (Linux, Windows, Android)
-src/ui/tt/            TrueType: font files, the installed fonts, outlines to coverage
+src/ui/tt/            TrueType: font files, the installed fonts, outlines to coverage;
+                      web fonts back to sfnt (`sfnt.zig`, `woff2*.zig`, `brotli*.zig`)
+src/ui/font_registry.zig  fonts an app brings, by family, weight, style and range
+src/ui/text_stack_*.zig   a text's fonts when it names families (`TextStyle.family`)
 src/ui/atlas_tt.zig   the glyph atlas in memory; icons.zig: line icons
 src/ui/raster.zig     the CPU renderer (same pixels as shader.metal)
 src/ui/canvas.zig     a CPU-drawn window's pixels: only what a frame changed is drawn
@@ -127,8 +132,10 @@ src/ui/frame_pace.zig a display-paced clock's decisions: gathered input, when to
 src/ui/gl.zig         OpenGL's functions, loaded with dlopen
 src/ui/images.zig     pictures (ui.image): decoded once, packed in a BGRA atlas
 src/ui/png_decode.zig PNG to pixels where ImageIO isn't (Linux, Windows, portable)
+src/ui/jpeg_decode.zig  JPEG likewise, baseline and progressive (jpeg_scan, jpeg_pixels); gif_decode.zig: a GIF's first frame
 src/platform.zig      what differs by OS below the UI (event loop, clipboard)
-src/linux/            GTK 3 backend: app, window, surface (GL area or CPU), dialogs, fd watches
+src/linux/            GTK 3 backend: app, window, surface (GL area or CPU), dialogs, fd watches;
+                      webkit: WebKitGTK, loaded with dlopen
 src/windows/          Win32 backend: app, window, surface (events, frames) +
                       surface_gpu (paint, D3D11 present), d3d (swap chain),
                       ime (IMM32), win32 (the extern layer), desktop, dialog,
@@ -148,13 +155,18 @@ src/android/          NativeActivity backend: the activity and the app's thread 
 src/menu_accel.zig    menus as accelerators (Linux, Windows, iOS, Android)
 src/kit/              nanoui.kit: components after GPUI Kit (buttons, overlays, tabs, forms)
 tools/*.Dockerfile    Linux (GTK, Xvfb) and Windows (Wine) test images
-tools/ios/            app bundles (bundle.zig), the Simulator (sim.sh), Zig's lib fixed (zig-lib.sh)
+tools/ios/            app bundles (bundle.zig, finish.sh, check-bundle.sh), the Simulator (sim.sh), Zig's lib fixed (zig-lib.sh)
 tools/android/        APKs (apk.zig: the SDK, the manifest, aapt2, pack.zig, apksigner), run.sh, emulator.sh
 examples/             hello (webview), counter and gallery (native UI), browser (local and remote pages)
 hillclimb/            headless benchmarks against mygo (its own package)
 apps/nanoterm/        the first app: a Warp-like terminal with ACP agents
 apps/nanomon/         a small activity monitor (libproc, Mach, /proc)
+apps/nanobrowser/     a web browser with its own engine, no webview (HTML, CSS, layout, JavaScript); its README says what it is not
 apps/nanomail/        a JMAP mail client for macOS and iOS
+apps/nanocua/         computer use for agents: MCP over a socket, the accessibility tree, input
+                      and screenshots in one app in the background, a panel with a kill switch
+                      (macOS). Vendored from codegraff, under its license, not MIT: change it
+                      there (VENDORED.md), not here
 site/                 the website (its own repo): Next.js on Cloudflare Workers, a gallery
 tools/lines.zig       the 600-line check
 tools/version.sh      set or check the version (build.zig.zon) for a release

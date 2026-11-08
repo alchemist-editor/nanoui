@@ -25,17 +25,7 @@ pub fn applyCursor(self: *Surface) void {
     if (self.cursor == .custom) if (self.custom_cursor) |cur| {
         return objc.msg(void, @as(objc.Object, @ptrCast(cur)), "set", .{});
     };
-    const name: [:0]const u8 = switch (self.cursor) {
-        .arrow, .custom => "arrowCursor",
-        .hand => "pointingHandCursor",
-        .text => "IBeamCursor",
-        .resize_left_right => "resizeLeftRightCursor",
-        .resize_up_down => "resizeUpDownCursor",
-        .open_hand => "openHandCursor",
-        .closed_hand => "closedHandCursor",
-        .not_allowed => "operationNotAllowedCursor",
-        .crosshair => "crosshairCursor",
-    };
+    const name = @import("surface_cursor.zig").name(self.cursor);
     objc.msg(void, objc.msg(objc.Object, objc.class("NSCursor"), name, .{}), "set", .{});
 }
 

@@ -153,3 +153,90 @@ test "level and ignores_mouse are applied on a hidden window, on its screen, tol
     try testing.expectEqual(@import("window.zig").Level.normal, plain.level());
     try testing.expect(!yes(plain, "ignoresMouseEvents"));
 }
+
+test "traffic_lights puts the buttons in a taller bar, and clicks beside them reach the view" {
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    var p: Page = .{};
+    const win = try app.newWindow(.{ .title = "lights", .width = 600, .height = 400, .visible = false, .title_bar = .hidden, .traffic_lights = .{ .x = 26, .y = 26 }, .content = .{ .view = .init(&p, Page.view) } });
+
+    const check = struct {
+        fn at(w: *Window) !void {
+            var last_x: f64 = 0;
+            for (0..3) |i| {
+                const b = objc.msg(objc.Object, w.nswindow, "standardWindowButton:", .{@as(objc.NSUInteger, i)});
+                const f = objc.msg(objc.CGRect, b, "frame", .{});
+                const bar = objc.msg(objc.Object, b, "superview", .{});
+                const bar_h = objc.msg(objc.CGRect, bar, "bounds", .{}).size.height;
+                try testing.expectApproxEqAbs(@as(f64, 26), bar_h - (f.origin.y + f.size.height / 2), 0.5);
+                if (i == 0) try testing.expectApproxEqAbs(@as(f64, 26), f.origin.x + f.size.width / 2, 0.5) //
+                else try testing.expect(f.origin.x - last_x >= 16);
+                last_x = f.origin.x;
+            }
+        }
+    }.at;
+    try check(win);
+    // AppKit lays the title bar out again on a resize: they are put back.
+    win.setSize(720, 480);
+    try check(win);
+
+    // In the strip, past the buttons but inside the grown title bar: the
+    // view takes it, or a tab row there could never be clicked.
+    const content = objc.msg(objc.Object, win.nswindow, "contentView", .{});
+    const theme_frame = objc.msg(objc.Object, content, "superview", .{});
+    const h = objc.msg(objc.CGRect, theme_frame, "bounds", .{}).size.height;
+    const hit = objc.msg(?objc.Object, theme_frame, "hitTest:", .{objc.CGPoint{ .x = 300, .y = h - 40 }}) orelse return error.NoHit;
+    try testing.expect(objc.msg(objc.BOOL, hit, "isDescendantOf:", .{content}) == objc.YES);
+}
+
+test "traffic_lights repairs a layout that finishes after its frame notification" {
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    var p: Page = .{};
+    const win = try app.newWindow(.{ .title = "lights", .width = 600, .height = 400, .visible = false, .title_bar = .hidden, .traffic_lights = .{ .x = 26, .y = 26 }, .content = .{ .view = .init(&p, Page.view) } });
+    const green = objc.msg(objc.Object, win.nswindow, "standardWindowButton:", .{@as(objc.NSUInteger, 2)});
+    const center = objc.msg(objc.Object, objc.class("NSNotificationCenter"), "defaultCenter", .{});
+
+    @import("platform.zig").runFor(0.02);
+    // Model a reentrant AppKit layout: notification first, then its final
+    // green-button write while our placement guard suppresses more callbacks.
+    // Repeated notifications must coalesce, not create a self-sustaining loop.
+    for (0..3) |_| objc.msg(void, center, "postNotificationName:object:", .{ NSViewFrameDidChangeNotification, green });
+    var frame = objc.msg(objc.CGRect, green, "frame", .{});
+    frame.origin.y += 20;
+    win.lights.?.placing = true;
+    objc.msg(void, green, "setFrame:", .{frame});
+    win.lights.?.placing = false;
+    try testing.expectApproxEqAbs(frame.origin.y, objc.msg(objc.CGRect, green, "frame", .{}).origin.y, 0.5);
+    @import("platform.zig").runFor(0.02);
+
+    for (0..3) |i| {
+        const b = objc.msg(objc.Object, win.nswindow, "standardWindowButton:", .{@as(objc.NSUInteger, i)});
+        const bounds = objc.msg(objc.CGRect, b, "bounds", .{});
+        const at = objc.msg(objc.CGPoint, b, "convertPoint:toView:", .{ objc.CGPoint{ .x = bounds.size.width / 2, .y = bounds.size.height / 2 }, @as(?objc.Object, null) });
+        const height = objc.msg(objc.CGRect, win.nswindow, "frame", .{}).size.height;
+        try testing.expectApproxEqAbs(@as(f64, 26), height - at.y, 0.5);
+        try testing.expectApproxEqAbs(26 + @as(f64, @floatFromInt(i)) * win.lights.?.spacing, at.x, 0.5);
+    }
+    try testing.expect(!win.lights.?.pending);
+    try testing.expect(!yes(win, "isVisible"));
+
+    // A queued repair must be harmless when its window closes first.
+    objc.msg(void, center, "postNotificationName:object:", .{ NSViewFrameDidChangeNotification, green });
+    try testing.expect(win.lights.?.pending);
+    win.close();
+    @import("platform.zig").runFor(0.02);
+    try testing.expectEqual(@as(usize, 0), app.windows.items.len);
+}
+
+extern "c" const NSViewFrameDidChangeNotification: objc.Object;
+
+test "traffic_lights is left alone without a hidden title bar" {
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    var p: Page = .{};
+    const win = try app.newWindow(.{ .title = "plain", .width = 300, .height = 200, .visible = false, .traffic_lights = .{ .x = 26, .y = 26 }, .content = .{ .view = .init(&p, Page.view) } });
+    try testing.expect(win.lights == null);
+}

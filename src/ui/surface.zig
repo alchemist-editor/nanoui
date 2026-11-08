@@ -17,7 +17,8 @@ const ui = @import("ui.zig");
 const Window = @import("../window.zig").Window;
 const a11y = @import("a11y.zig");
 const events = @import("surface_events.zig");
-const wake = @import("surface_wake.zig");
+const thread_wake = @import("surface_thread_wake.zig");
+const link_pace = @import("surface_pacing.zig");
 const pointer = @import("surface_pointer.zig");
 const frame_log_mod = @import("frame_log.zig");
 pub const FrameLog = frame_log_mod.FrameLog;
@@ -63,10 +64,14 @@ pub const Surface = struct {
     full_pending: bool = false,
     retained_ready: bool = false,
     frame_in_due: f64 = 0,
+    wake: @import("surface_wake.zig").Wake = .{},
     pending_sync: bool = false,
     /// A frame was wanted while the window was hidden: run it once visible.
     pending: bool = false,
     dead: bool = false,
+    /// `destroy` ran after the app's run loop stopped: queued ticks and
+    /// wakes will never fire, so the surface must not wait for them.
+    force_destroy: bool = false,
     torn_down: bool = false,
     /// The window is being resized: only its size changes draw (each when
     /// the layer is displayed); the link waits, and what else asks for a
@@ -82,7 +87,6 @@ pub const Surface = struct {
     reduce_motion: bool = false,
     is_visible: bool = false,
     released: bool = false,
-    in_live_resize: bool = false,
     /// When the live resize last changed the size: the link stays awake a
     /// little after it (`resizeStepping`), not for the whole drag.
     resize_step_at: f64 = 0,
@@ -133,8 +137,9 @@ pub const Surface = struct {
             // Before anything can run a frame: setContentView: resizes the view.
             .start_time = cf.CACurrentMediaTime(),
         };
+        if (text.portable and !window.app.flags.hidden) self.text.enablePersistence(window.app.options.name);
         self.ctx = .init(gpa, &self.text);
-        self.ctx.waker = .{ .ctx = self, .wake = wake.fromContext };
+        self.ctx.waker = .{ .ctx = self, .wake = thread_wake.fromContext };
         // Pictures go straight to the GPU before any view callback can run a frame.
         self.text.images.sink = .{ .ctx = &self.renderer, .upload = @import("metal.zig").Renderer.uploadImage };
         self.refreshAppearance();
@@ -163,9 +168,7 @@ pub const Surface = struct {
             const ws = objc.msg(objc.Object, objc.class("NSWorkspace"), "sharedWorkspace", .{});
             self.reduce_motion = objc.msg(objc.BOOL, ws, "accessibilityDisplayShouldReduceMotion", .{});
             const center = objc.msg(objc.Object, ws, "notificationCenter", .{});
-            objc.msg(void, center, "addObserver:selector:name:object:", .{
-                nsview, objc.sel("accessibilityChanged:"), objc.nsString("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification"), @as(?objc.Object, null),
-            });
+            objc.msg(void, center, "addObserver:selector:name:object:", .{ nsview, objc.sel("accessibilityChanged:"), objc.nsString("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification"), @as(?objc.Object, null) });
         }
         self.refreshAppearance();
         self.is_visible = objc.msg(objc.BOOL, window.nswindow, "isVisible", .{}) and (objc.msg(objc.NSUInteger, window.nswindow, "occlusionState", .{}) & 2 != 0);
@@ -200,6 +203,7 @@ pub const Surface = struct {
 
     pub fn destroy(self: *Surface) void {
         self.dead = true;
+        self.force_destroy = !self.window.app.running;
         if (!self.in_frame) self.finishDestroy();
     }
     pub fn finishDestroy(self: *Surface) void {
@@ -228,11 +232,11 @@ pub const Surface = struct {
             self.pacing_log.close();
             if (self.frame_log) |*fl| fl.deinit();
         }
-        if (!self.tick_scheduled and !self.wake_pending.load(.acquire)) self.gpa.destroy(self);
+        if (self.force_destroy or (!self.tick_scheduled and !self.wake_pending.load(.acquire) and self.wake.pending == 0)) self.gpa.destroy(self);
     }
 
-    /// From any thread: a frame at the display's next refresh (`surface_wake.zig`).
-    pub const requestFrameFromAnyThread = wake.request;
+    /// From any thread: a frame at the display's next refresh (`surface_thread_wake.zig`).
+    pub const requestFrameFromAnyThread = thread_wake.request;
 
     fn finishFrame(self: *Surface) void {
         self.in_frame = false;
@@ -257,23 +261,9 @@ pub const Surface = struct {
         self.updateMaxFps();
     }
 
-    fn updateMaxFps(self: *Surface) void {
-        const screen = objc.msg(?objc.Object, self.window.nswindow, "screen", .{});
-        const screen_fps: f32 = if (screen) |sc| @floatFromInt(@max(60, objc.msg(objc.NSInteger, sc, "maximumFramesPerSecond", .{}))) else 60;
-        const fps = if (self.fps_cap > 0) @min(self.fps_cap, screen_fps) else screen_fps;
-        if (fps != self.max_fps) {
-            self.max_fps = fps;
-            const cur = self.link_fps;
-            self.link_fps = -1;
-            if (cur >= 0) self.setRate(if (cur == 0) null else 1 / cur);
-        }
-    }
-
+    const updateMaxFps = link_pace.updateMaxFps;
     /// Caps the display link's pace at `fps` (0 lifts the cap).
-    pub fn setFpsCap(self: *Surface, fps: f32) void {
-        self.fps_cap = fps;
-        self.updateMaxFps();
-    }
+    pub const setFpsCap = link_pace.setFpsCap;
 
     pub fn refreshAppearance(self: *Surface) void {
         const appearance = objc.msg(objc.Object, self.nsview, "effectiveAppearance", .{});
@@ -347,7 +337,7 @@ pub const Surface = struct {
         self.pacing_log.note(now);
         // What scrolling gathered since the last frame, applied at once.
         const dy = self.scroll.take();
-        if (dy != 0 and !c.applyScroll(dy) and (c.wants_wheel or c.wheelAt())) c.input.scroll = .{ .y = dy };
+        if (dy != 0 and !c.applyScroll(dy) and (c.wants_wheel or c.wheelAt())) c.input.scroll.y += dy;
         const r = frame_mod.run(c, self.view, &self.text, &self.instances, self.size, self.scale, a11y.themed(self, self.theme()), dt, now - self.start_time);
         if (self.dead) return;
         a11y.afterFrame(self);
@@ -415,9 +405,8 @@ pub const Surface = struct {
             if (more) {
                 self.setRate(null);
                 self.setPaced(true);
-            } else if (c.frame_in) |fi| {
-                self.setRate(fi);
-                self.setPaced(true);
+            } else if (c.frame_in != null) {
+                @import("surface_wake.zig").at(self, self.frame_in_due); // not a slowed link: see there
             } else if (c.time_driven != .none) {
                 self.setRate(if (c.time_driven == .fast) null else 1.0 / 24.0);
                 self.setPaced(true);
@@ -429,37 +418,9 @@ pub const Surface = struct {
         }
     }
 
-    /// How long the link keeps running after a live-resize step: a drag's
-    /// next step lands on a running link, and a held mouse stops it.
-    const resize_grace = 0.25;
-
-    /// A live resize is changing the size now: a held mouse is not.
-    pub fn resizeStepping(self: *Surface) bool {
-        return self.in_live_resize and cf.CACurrentMediaTime() - self.resize_step_at < resize_grace;
-    }
-
-    /// One live-resize step drawn in the window's own transaction: the
-    /// frame is laid out and presented at this size before Core Animation
-    /// composites the step, so the window never shows a stale one. False
-    /// when it can't (hidden, or `NANOUI_RESIZE_SYNC=0`): the link draws.
-    pub fn resizeSyncEnabled(_: *Surface) bool {
-        if (getenv("NANOUI_RESIZE_SYNC")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
-        return true;
-    }
-
-    pub fn resizeInTransaction(self: *Surface) bool {
-        if (self.in_frame or self.dead or !self.visible() or self.display_link != null) return false;
-        if (!self.resizeSyncEnabled()) return false;
-        const drawable = objc.msg(?objc.Object, self.renderer.layer, "nextDrawable", .{}) orelse return false;
-        self.renderer.given_drawable = drawable;
-        defer self.renderer.given_drawable = null;
-        self.pending_sync = true;
-        self.full_pending = true;
-        const now = @max(cf.CACurrentMediaTime(), self.last_frame_time);
-        const fallback_dur = 1.0 / @as(f64, @max(60.0, self.max_fps));
-        self.frameAt(.input, now, if (self.link_duration > 0) self.link_duration else fallback_dur);
-        return true;
-    }
+    pub const resizeStepping = link_pace.resizeStepping;
+    pub const resizeSyncEnabled = link_pace.resizeSyncEnabled;
+    pub const resizeInTransaction = link_pace.resizeInTransaction;
 
     pub fn redrawRetained(self: *Surface, target_in: f64, duration_in: f64) void {
         if (self.in_frame or self.dead) return;
@@ -532,6 +493,7 @@ pub const Surface = struct {
             presented = self.renderer.drawLogged(self.instances.items, self.atlasTexture(), self.size, clear, null, 0).presented;
         }
         if (presented) self.last_present_target = present_at;
+        if (presented) @import("surface_wake.zig").presented(self);
         return presented;
     }
 
@@ -560,7 +522,7 @@ pub const Surface = struct {
 
     /// The display link's pace: the display's (null), or one frame every
     /// `seconds`.
-    fn setRate(self: *Surface, seconds: ?f32) void {
+    pub fn setRate(self: *Surface, seconds: ?f32) void {
         const link = self.display_link orelse return;
         const fps: f32 = if (seconds) |s| (if (s < 0.009) 0 else std.math.clamp(1 / @max(s, 0.001), 1, 60)) else 0;
         if (fps == self.link_fps) return;
@@ -585,12 +547,11 @@ pub const Surface = struct {
         return self.is_visible;
     }
 
-    fn setPaced(self: *Surface, on: bool) void {
+    pub fn setPaced(self: *Surface, on: bool) void {
+        if (on) @import("surface_wake.zig").watch(self);
         if (self.paced == on) return;
         self.paced = on;
-        if (!on) if (self.frame_log) |*fl| {
-            fl.last_t = 0;
-        };
+        if (!on and self.frame_log != null) self.frame_log.?.last_t = 0;
         if (self.display_link) |link| objc.msg(void, link, "setPaused:", .{!on});
     }
 
@@ -623,7 +584,7 @@ pub const Surface = struct {
         return @ptrCast(self.nsview);
     }
 
-    const scheduleTick = wake.scheduleTick;
+    const scheduleTick = thread_wake.scheduleTick;
     pub fn toView(self: *Surface, p: objc.CGPoint) types.Point {
         const local = objc.msg(objc.CGPoint, self.nsview, "convertPoint:fromView:", .{ p, @as(?objc.Object, null) });
         return .{ .x = @floatCast(local.x), .y = @floatCast(local.y) };

@@ -55,6 +55,7 @@ pub const Point = types.Point;
 pub const Face = types.Face;
 pub const Fade = types.Fade;
 pub const Size = types.Size;
+pub const Affine = types.Affine;
 pub const Rect = types.Rect;
 pub const Color = types.Color;
 pub const Edges = types.Edges;
@@ -62,6 +63,10 @@ pub const Length = types.Length;
 pub const Style = types.Style;
 pub const Pulse = types.Pulse;
 pub const TextStyle = types.TextStyle;
+pub const WrapRule = types.WrapRule;
+pub const BaselineRule = types.BaselineRule;
+pub const GlyphSnap = types.GlyphSnap;
+pub const SpanBox = types.SpanBox;
 pub const Truncate = types.Truncate;
 pub const Shadow = types.Shadow;
 pub const Glass = types.Glass;
@@ -129,6 +134,10 @@ pub const scroll = widgets.scroll;
 pub const spacer = widgets.spacer;
 pub const divider = widgets.divider;
 pub const image = widgets.image;
+pub const imageSize = widgets.imageSize;
+pub const imageLimits = widgets.imageLimits;
+pub const imageTypeDecodes = widgets.imageTypeDecodes;
+pub const ImageLimits = @import("images.zig").Limits;
 pub const texture = widgets.texture;
 pub const textureAffine = widgets.textureAffine;
 pub const hole = widgets.hole;
@@ -164,6 +173,20 @@ pub const ImageOptions = widgets.ImageOptions;
 pub const svg = widgets.svg;
 /// A font the app brings, found by family name (`Theme.font`, …).
 pub const registerFont = @import("font_registry.zig").register;
+/// A face from a TrueType, OpenType, WOFF or WOFF2 file's bytes (or an installed
+/// font), under a family `TextStyle.family` finds it by.
+pub const registerFontFace = @import("font_registry.zig").registerFace;
+pub const FontFaceOptions = @import("font_registry.zig").FaceOptions;
+/// Gives a face registered as `pending` its file, or the installed font it is.
+pub const fillFontFace = @import("font_registry.zig").fillFace;
+/// Takes away the families `registerFontFace` added whose names start so.
+pub const unregisterFontFamilies = @import("font_registry.zig").unregisterFamilies;
+/// How far a face's description is from a style, as CSS's font matching ranks them.
+pub const fontFaceScore = @import("font_registry.zig").score;
+/// Text shaped by nanoui's own TrueType reader, not the system's.
+pub const portable = @import("text.zig").portable;
+/// A tiny font made on the spot, for tests that need one that isn't installed.
+pub const test_font = @import("tt/testfont.zig");
 pub const SvgOptions = widgets.SvgOptions;
 pub const text = widgets.text;
 pub const textf = widgets.textf;
@@ -188,10 +211,17 @@ pub const TextFieldOptions = textfield.Options;
 pub const TextBuffer = textfield.TextBuffer;
 pub const TextFieldResult = textfield.Result;
 pub const TextFieldCaret = textfield.Caret;
+/// A bounded, inertial ruler with clipped rolling numerals.
+pub const RulerPicker = @import("ruler.zig").RulerPicker;
+pub const RulerOptions = @import("ruler.zig").Options;
 /// Declarative, interruptible animation (springs, tweens, presence).
 pub const motion = @import("motion/motion.zig");
 pub const div = @import("div.zig").div;
 pub const Div = @import("div.zig").Div;
+/// Delayed, window-contained hints for a control.
+pub const TooltipOptions = @import("tooltip.zig").Options;
+pub const tooltip = @import("tooltip.zig").tooltip;
+pub const tooltipWith = @import("tooltip.zig").tooltipWith;
 pub const list = @import("list.zig").list;
 pub const ListOptions = @import("list.zig").Options;
 pub const ListRows = @import("list.zig").Rows;
@@ -250,7 +280,17 @@ pub const View = struct {
 };
 
 test {
+    _ = @import("tests_ruler.zig");
     _ = @import("tests_motion.zig");
+    _ = @import("motion/tests_catalog.zig");
+    _ = @import("motion/tests_reduced_motion.zig");
+    _ = @import("tests_context_parity.zig");
+    _ = @import("tests_tooltip_parity.zig");
+    _ = @import("tests_text_parity.zig");
+    _ = @import("tests_paint_parity.zig");
+    _ = @import("tests_textfield_parity.zig");
+    _ = @import("tests_live_theme.zig");
+    _ = @import("tests_field_layout.zig");
     _ = frame_log;
     _ = @import("present_slots.zig");
     _ = @import("tests_effects.zig");
@@ -262,6 +302,7 @@ test {
     _ = @import("tests_text_style.zig");
     _ = @import("tests_text_extras.zig");
     _ = @import("tests_turn.zig");
+    _ = @import("tests_transform.zig");
     _ = @import("tests_settle.zig");
     _ = types;
     _ = device;
@@ -288,6 +329,7 @@ test {
     _ = @import("tests.zig");
     _ = @import("tests_keymap.zig");
     _ = @import("tests_multiline.zig");
+    _ = @import("tests_handles.zig");
     _ = @import("tests_texture.zig");
     _ = @import("tests_texture_affine.zig");
     _ = @import("tests_texture_color.zig");
@@ -322,8 +364,14 @@ test {
     if (@import("builtin").os.tag == .linux) _ = @import("tests_opengl.zig");
     _ = @import("tt/raster.zig");
     _ = @import("tt/tests.zig");
+    _ = @import("tt/tests_decode.zig");
+    _ = @import("tt/brotli.zig");
+    _ = @import("font_registry.zig");
+    _ = @import("tests_text_family.zig");
     _ = @import("png.zig");
     _ = @import("png_decode.zig");
+    _ = @import("jpeg_decode.zig");
+    _ = @import("gif_decode.zig");
     _ = @import("images.zig");
     _ = @import("tests_images.zig");
     _ = @import("pacing.zig");

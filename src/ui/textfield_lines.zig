@@ -4,8 +4,10 @@
 //! them up to its most lines, then scrolling inside.
 const std = @import("std");
 const types = @import("types.zig");
+const utf8 = @import("utf8.zig");
 const Context = @import("context.zig").Context;
 const EditState = @import("context.zig").EditState;
+const textedit = @import("textedit.zig");
 
 /// The caret's bar: `width` points wide, `inset` points short of the line
 /// box at its top and bottom, its corners rounded `radius`. A chat composer
@@ -19,6 +21,12 @@ pub const Caret = struct {
 /// One line as drawn: bytes [start, end) shown, and the caret positions up
 /// to `stop` (the next line's start, or the newline) belonging to it.
 pub const Line = struct { start: usize, end: usize, stop: usize };
+
+/// A byte index in the displayed text (one three-byte bullet per codepoint).
+pub fn shownIndex(s: []const u8, password: bool, index: usize) usize {
+    if (!password) return index;
+    return (std.unicode.utf8CountCodepoints(s[0..index]) catch index) * 3;
+}
 
 /// `s` in lines no wider than `width`, in the frame's memory.
 pub fn layout(c: *Context, s: []const u8, style: types.TextStyle, width: f32) []const Line {
@@ -73,6 +81,25 @@ pub fn indexAtPoint(c: *Context, s: []const u8, style: types.TextStyle, lines: [
     return indexAt(c, s, style, lines[row], x);
 }
 
+/// The selection's ends, for a field whose lines start at (x, y): the text's
+/// own place on the screen, its scroll taken off.
+pub fn ends(c: *Context, s: []const u8, style: types.TextStyle, lines: []const Line, lo: usize, hi: usize, x: f32, y: f32, lh: f32) [2]types.Rect {
+    var out: [2]types.Rect = undefined;
+    for ([2]usize{ lo, hi }, &out) |at, *r| {
+        const k = lineOf(lines, at);
+        r.* = .{ .x = x + caretX(c, s, style, lines[k], at), .y = y + @as(f32, @floatFromInt(k)) * lh, .w = 0, .h = lh };
+    }
+    return out;
+}
+
+/// The byte of a password's `n`th bullet.
+pub fn byteOfCodepoint(s: []const u8, n: usize) usize {
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < s.len and k < n) : (k += 1) i += utf8.seqLen(s[i]);
+    return @min(i, s.len);
+}
+
 pub const Drawn = struct {
     /// The caret's place in the field's content, scrolled.
     caret: types.Point,
@@ -120,7 +147,9 @@ pub fn draw(c: *Context, s: []const u8, e: *EditState, style: types.TextStyle, l
     if (s.len == 0) _ = c.leaf(.{ .absolute = true }, .{ .text = .{ .str = placeholder, .style = style, .color = placeholder_color } }, null);
     if (suggestion.len > 0 and focused and e.caret == s.len)
         _ = c.leaf(.{ .absolute = true, .offset = .{ .x = cx, .y = cy } }, .{ .text = .{ .str = suggestion, .style = style, .color = th.muted.alpha(0.8) } }, null);
-    if (focused and hi == lo) {
+    // Vim's normal mode keeps its block in place; otherwise the caret
+    // blinks, as a terminal's does, and asks for the frame that turns it.
+    if (focused and hi == lo and (block or textedit.caretVisible(c))) {
         const l = lines[k];
         const w: f32 = if (!block) caret.width else if (e.caret < l.end) @max(4, caretX(c, s, style, l, e.caret + 1) - cx) else c.text.width("m", style);
         const inset: f32 = if (block) 0 else caret.inset;

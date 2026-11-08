@@ -99,12 +99,26 @@ pub const Level = enum(i32) {
 pub fn Options(comptime Window: type) type {
     return struct {
         title: []const u8 = "",
+        /// The window's icon, in the platform's own container: ICO on
+        /// Windows, ICNS or PNG on macOS, PNG on GTK 3. Windows draws it in
+        /// the title bar and the taskbar; macOS sets the Dock icon (a
+        /// bundled .app's own `CFBundleIconFile` wins); GTK 3 sets the window
+        /// icon its window manager draws (GTK 4 dropped window icons, and on
+        /// Wayland the shell takes it from the .desktop file).
+        icon: ?[]const u8 = null,
         width: f64 = 800,
         height: f64 = 600,
         min_width: f64 = 200,
         min_height: f64 = 150,
         resizable: bool = true,
         title_bar: TitleBar = .default,
+        /// With `title_bar = .hidden`, macOS: where the close button's center
+        /// goes, from the window's top left, the title bar grown to twice
+        /// `y` to hold it; the other two follow at AppKit's spacing. Lets a
+        /// view's own taller top bar (`ui.Context.title_bar_height`) line up
+        /// with them. Null leaves them where AppKit puts them; other systems
+        /// have none to move.
+        traffic_lights: ?ui.Point = null,
         /// Whether the window has a title bar and a resizable frame at all.
         /// `false` is a borderless window: no title bar, no border and no
         /// drag-to-resize — the application draws or moves it,
@@ -167,6 +181,11 @@ pub fn Options(comptime Window: type) type {
         /// (`ui.Context.safe_area`); without it, the view is laid out
         /// inside the safe area. Elsewhere it changes nothing.
         full_bleed: bool = false,
+        /// iPad: a window of its own beside the app's, which the person can
+        /// move and close as any other (needs `ios.Options.multiple_windows`).
+        /// On a phone it covers the screen like any other window. Elsewhere
+        /// it changes nothing: every window has its own place.
+        own_scene: bool = false,
         /// Called as the window closes, before it is freed.
         on_close: ?Callback(Window) = null,
         /// Called after the window resized.

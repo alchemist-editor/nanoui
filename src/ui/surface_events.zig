@@ -255,13 +255,14 @@ fn scrollWheel(obj: objc.Object, _: objc.SEL, event: objc.Object) callconv(.c) v
     // Sideways always reaches the view (rows that scroll sideways); down
     // and up the scrolling box under the pointer, else a view that takes it.
     const took = dy != 0 and s.ctx.applyScroll(0);
-    if (took) s.scroll.add(dy, cf.CACurrentMediaTime());
     const wheel = (s.ctx.wants_wheel or s.ctx.wheelAt()) and !took;
+    // A view taking the wheel keeps the same beat as a scrolling box: events come
+    // unevenly, and a display link stopping between them misses frames.
+    if (took or (wheel and s.visible())) s.scroll.add(dy, cf.CACurrentMediaTime());
     const release_over = !s.ctx.scroll_holding and s.ctx.hasOverscroll();
     if (!took and dx == 0 and !wheel and !release_over) return;
     if (s.visible()) {
         in.scroll.x += dx;
-        if (wheel) in.scroll.y += dy;
         s.requestFrame();
     } else {
         in.scroll = .{ .x = dx, .y = if (wheel) dy else 0 };
@@ -321,6 +322,7 @@ fn performDragOperation(obj: objc.Object, _: objc.SEL, info: objc.Object) callco
 fn metalDisplayLinkNeedsUpdate(obj: objc.Object, _: objc.SEL, _: objc.Object, update: objc.Object) callconv(.c) void {
     const s = surfaceOf(obj) orelse return;
     if (s.dead or s.in_frame) return;
+    s.wake.last_tick = cf.CACurrentMediaTime();
     const target = objc.msg(f64, update, "targetPresentationTimestamp", .{});
     const frame_in_due = s.ctx.frame_in != null and target >= s.frame_in_due - 0.001;
     if (!s.full_pending and !frame_in_due and !s.ctx.animating and !s.geometry_changed and !s.retained_ready and !s.pending_sync and s.ctx.time_driven == .none) {
@@ -346,7 +348,7 @@ fn liveResizeStart(obj: objc.Object, _: objc.SEL) callconv(.c) void {
     // instead stall the main thread on `waitUntilScheduled` (2-18 resize
     // steps a second instead of the drag's 180). Each step asks for its
     // frame (`setFrameSize`); held still, the link stops after a moment.
-    s.in_live_resize = true;
+    s.ctx.live_resizing = true;
     s.resize_step_at = cf.CACurrentMediaTime();
     if (s.resizeSyncEnabled()) s.stopLink();
     s.requestFrame();
@@ -355,7 +357,7 @@ fn liveResizeStart(obj: objc.Object, _: objc.SEL) callconv(.c) void {
 fn liveResizeEnd(obj: objc.Object, _: objc.SEL) callconv(.c) void {
     objc.msgSuper(void, obj, objc.class("NSView"), "viewDidEndLiveResize", .{});
     const s = surfaceOf(obj) orelse return;
-    s.in_live_resize = false;
+    s.ctx.live_resizing = false;
     s.startLink();
     s.requestFrame();
 }
@@ -366,7 +368,7 @@ fn setFrameSize(obj: objc.Object, _: objc.SEL, size: objc.CGSize) callconv(.c) v
     s.updateGeometry();
     // In a drag the link's next frame lays out at this size: a frame now
     // would have no drawable to present.
-    if (s.in_live_resize) {
+    if (s.ctx.live_resizing) {
         s.resize_step_at = cf.CACurrentMediaTime();
         if (s.resizeInTransaction()) return;
         return s.requestFrame();

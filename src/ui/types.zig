@@ -108,7 +108,40 @@ pub const Length = union(enum) {
 pub const Direction = enum { row, column };
 pub const Align = enum { start, center, end, stretch };
 pub const Justify = enum { start, center, end, space_between };
-pub const Weight = enum { regular, medium, semibold, bold };
+/// A font's weight. The names beyond the first four came later and go after
+/// them, so each keeps its number; `TextStyle.css_weight` asks for any other.
+pub const Weight = enum {
+    regular,
+    medium,
+    semibold,
+    bold,
+    thin,
+    extralight,
+    light,
+    extrabold,
+    black,
+
+    /// Its number on CSS's scale of 1 to 1000.
+    pub fn css(w: Weight) u16 {
+        return switch (w) {
+            .thin => 100,
+            .extralight => 200,
+            .light => 300,
+            .regular => 400,
+            .medium => 500,
+            .semibold => 600,
+            .bold => 700,
+            .extrabold => 800,
+            .black => 900,
+        };
+    }
+
+    /// The name nearest a number on CSS's scale.
+    pub fn of(n: u16) Weight {
+        const names = [_]Weight{ .thin, .extralight, .light, .regular, .medium, .semibold, .bold, .extrabold, .black };
+        return names[@min((n +| 50) / 100, 9) -| 1];
+    }
+};
 
 /// One color of a gradient of many stops (`Style.gradient_stops`), at `at`
 /// (0 the anchor's top, 1 its bottom).
@@ -129,11 +162,76 @@ pub const Shadow = struct {
     /// 0 shrinks it, as CSS's spread radius does.
     spread: f32 = 0,
 
+    /// Tailwind's `shadow-md`, as GPUI draws it: tooltips and cards.
+    pub const md = [_]Shadow{
+        .{ .color = .{ .a = 0.1 }, .blur = 6, .y = 4, .spread = -1 },
+        .{ .color = .{ .a = 0.1 }, .blur = 4, .y = 2, .spread = -2 },
+    };
+
     /// Tailwind's `shadow-lg`, as GPUI draws it: two faint layers.
     pub const lg = [_]Shadow{
         .{ .color = .{ .a = 0.1 }, .blur = 15, .y = 10, .spread = -3 },
         .{ .color = .{ .a = 0.1 }, .blur = 6, .y = 4, .spread = -4 },
     };
+};
+
+/// A transform of the plane: x' = a x + c y + e, y' = b x + d y + f.
+pub const Affine = struct {
+    a: f32 = 1,
+    b: f32 = 0,
+    c: f32 = 0,
+    d: f32 = 1,
+    e: f32 = 0,
+    f: f32 = 0,
+
+    pub fn apply(m: Affine, x: f32, y: f32) Point {
+        return .{ .x = m.a * x + m.c * y + m.e, .y = m.b * x + m.d * y + m.f };
+    }
+
+    /// `m` after `n`: what `n` puts somewhere, `m` then moves.
+    pub fn times(m: Affine, n: Affine) Affine {
+        return .{
+            .a = m.a * n.a + m.c * n.b,
+            .b = m.b * n.a + m.d * n.b,
+            .c = m.a * n.c + m.c * n.d,
+            .d = m.b * n.c + m.d * n.d,
+            .e = m.a * n.e + m.c * n.f + m.e,
+            .f = m.b * n.e + m.d * n.f + m.f,
+        };
+    }
+
+    /// What undoes it; null when it flattens the plane to a line or a point.
+    pub fn inverse(m: Affine) ?Affine {
+        const det = m.a * m.d - m.b * m.c;
+        if (@abs(det) < 1e-9) return null;
+        const k = 1 / det;
+        return .{
+            .a = m.d * k,
+            .b = -m.b * k,
+            .c = -m.c * k,
+            .d = m.a * k,
+            .e = (m.c * m.f - m.d * m.e) * k,
+            .f = (m.b * m.e - m.a * m.f) * k,
+        };
+    }
+
+    /// The smallest rectangle holding what becomes of `r`.
+    pub fn bounds(m: Affine, r: Rect) Rect {
+        const xs = [4]f32{ r.x, r.x + r.w, r.x, r.x + r.w };
+        const ys = [4]f32{ r.y, r.y, r.y + r.h, r.y + r.h };
+        var x0 = std.math.inf(f32);
+        var y0 = std.math.inf(f32);
+        var x1 = -std.math.inf(f32);
+        var y1 = -std.math.inf(f32);
+        for (xs, ys) |x, y| {
+            const p = m.apply(x, y);
+            x0 = @min(x0, p.x);
+            y0 = @min(y0, p.y);
+            x1 = @max(x1, p.x);
+            y1 = @max(y1, p.y);
+        }
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
 };
 
 /// The style of a box, in the manner of CSS flexbox.
@@ -144,6 +242,8 @@ pub const Glass = struct {
     style: Kind = .regular,
     /// Colors the glass toward this, by its alpha: a prominent button's.
     tint: Color = .transparent,
+    /// `frost`: how far it blurs, in points.
+    blur: f32 = 8,
 
     pub const Kind = enum {
         /// Frosts and lightens (darkens, in dark mode) what shows through,
@@ -151,6 +251,9 @@ pub const Glass = struct {
         regular,
         /// Barely frosts or tones it: glass over photos and video.
         clear,
+        /// Only blurs it by `blur`: no rim, no lens, no tone (a web page's
+        /// `backdrop-filter`).
+        frost,
     };
 };
 
@@ -234,6 +337,13 @@ pub const Style = struct {
     layer: u8 = 0,
     /// Children are clipped to the box.
     clip: bool = false,
+    /// Which corners `radius` rounds when it clips its children (1 top left,
+    /// 2 top right, 4 bottom right, 8 bottom left).
+    clip_corners: u4 = 15,
+    /// The box and everything in it drawn through this, in the window's
+    /// coordinates, after layout: any mix of turning, scaling, skewing and
+    /// moving, composing with boxes around it. Input goes by where it lands.
+    transform: ?Affine = null,
     /// A scrolling box that stays at its end as its content grows, while
     /// it was at its end: logs, chats, terminals.
     follow_end: bool = false,
@@ -313,6 +423,8 @@ pub const Span = struct {
     end: u32,
     color: ?Color = null,
     weight: ?Weight = null,
+    /// A family list for this span (`TextStyle.family`).
+    family: ?[]const u8 = null,
     italic: bool = false,
     mono: bool = false,
     background: ?Color = null,
@@ -321,8 +433,41 @@ pub const Span = struct {
 
     /// Whether it changes the font, so the text is shaped with its runs.
     pub fn styled(s: Span) bool {
-        return s.weight != null or s.italic or s.mono;
+        return s.weight != null or s.family != null or s.italic or s.mono;
     }
+};
+
+/// How text breaks into lines (`TextSystem.wrap_rule`).
+pub const WrapRule = enum {
+    /// Where the platform's typesetter suggests (CoreText on Apple systems).
+    typesetter,
+    /// A paragraph's glyph positions, breaking before the overflowing word
+    /// or glyph, as GPUI's `LineLayout::compute_wrap_boundaries` does.
+    glyph_positions,
+};
+
+/// What is centered within a line's extra height (`TextSystem.baseline_rule`).
+pub const BaselineRule = enum {
+    /// The font's line: ascent, descent and leading, rounded up.
+    font_line,
+    /// Ascent and descent alone, as GPUI and CSS place the glyphs.
+    glyph_box,
+};
+
+/// How glyph origins land on device pixels (`TextSystem.glyph_snap`).
+pub const GlyphSnap = enum {
+    /// Baseline to the nearest pixel, x down to a quarter pixel.
+    nearest,
+    /// Both to nearest (quarters across), with ties toward zero, as GPUI.
+    half_toward_zero,
+};
+
+/// A span's background relative to its line's box: horizontal padding,
+/// vertical inset from the line's edges, and corner radius, in points.
+pub const SpanBox = struct {
+    pad_x: f32,
+    inset_y: f32,
+    radius: f32,
 };
 
 pub const TextStyle = struct {
@@ -333,6 +478,9 @@ pub const TextStyle = struct {
     wrap: bool = false,
     mono: bool = false,
     italic: bool = false,
+    /// Use the system's proportional font, not the theme's (tooltips).
+    /// Monospaced text still uses the theme's monospaced family.
+    system_font: bool = false,
     /// Line height as a multiple of the font's (1.5 for airy prose).
     leading: f32 = 1,
     /// Line height in points (CSS's `line-height: 22px`), taking the place
@@ -341,6 +489,9 @@ pub const TextStyle = struct {
     /// Inline code's size (`Span.mono`) over the text's: smaller, as the
     /// monospaced font looks larger at the same size; 1 keeps it.
     mono_scale: f32 = 0.9,
+    /// A span background's padding, inset and radius relative to its line.
+    /// Null keeps the default background fitted to the font's glyph box.
+    span_box: ?SpanBox = null,
     /// A line longer than its box (text that doesn't wrap): cut before an
     /// ellipsis, faded toward its end, or shortened through its middle.
     truncate: Truncate = .none,
@@ -359,6 +510,26 @@ pub const TextStyle = struct {
     /// The system face's serif design (New York on Apple systems); others
     /// keep their own.
     serif: bool = false,
+    /// The fonts to draw this text in, by family, comma separated: each
+    /// character in the first that has it (fonts brought with
+    /// `ui.registerFontFace` honouring their ranges), then the system's
+    /// fallback. `system-ui`, `ui-monospace`, `ui-serif` and `ui-rounded` name
+    /// the system's own. Names not found are skipped; none found, or null, is
+    /// the theme's font. Compared by contents; it needs to live as long as the
+    /// style does.
+    family: ?[]const u8 = null,
+    /// A weight on CSS's scale (1 to 1000) in place of `weight` when above 0:
+    /// nearest face, or the exact one on a variable font.
+    css_weight: u16 = 0,
+    /// A width as CSS's `font-stretch` percentage, where a face of it exists.
+    stretch: u16 = 100,
+    /// Standard ligatures (`fi`); CSS turns them off when letters are spaced.
+    ligatures: bool = true,
+
+    /// The weight asked for, on CSS's scale.
+    pub fn weightValue(s: TextStyle) u16 {
+        return if (s.css_weight != 0) s.css_weight else s.weight.css();
+    }
 
     /// Cut to one line that fits, at its end or in its middle.
     pub fn cuts(s: TextStyle) bool {

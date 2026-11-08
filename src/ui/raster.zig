@@ -198,20 +198,37 @@ fn drawGroup(out: gpu.Pixels, span: []const gpu.Instance, begin_inst: *const gpu
 fn unit(v: f32) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0, 1) * 255));
 }
-pub inline fn unrotate(i: *const gpu.Instance, wx: f32, wy: f32) [2]f32 {
+/// Where a pixel is before the instance's plane transform (`Instance.m`).
+pub inline fn unmatrix(i: *const gpu.Instance, wx: f32, wy: f32) [2]f32 {
+    if (!gpu.hasMatrix(i)) return .{ wx, wy };
+    const det = i.m[0] * i.m[3] - i.m[1] * i.m[2];
+    if (@abs(det) < 1e-9) return .{ -1e9, -1e9 };
+    const dx = wx - i.mt[0];
+    const dy = wy - i.mt[1];
+    return .{ (i.m[3] * dx - i.m[2] * dy) / det, (i.m[0] * dy - i.m[1] * dx) / det };
+}
+
+/// A pixel's size where a shape is worked out: what a `fwidth` of it finds.
+pub inline fn pixelAt(i: *const gpu.Instance, inv: f32) f32 {
+    if (!gpu.hasMatrix(i)) return inv;
+    return inv / @max(@sqrt(@abs(i.m[0] * i.m[3] - i.m[1] * i.m[2])), 1e-3);
+}
+
+pub inline fn unrotate(i: *const gpu.Instance, wx_in: f32, wy_in: f32) [2]f32 {
+    const p = unmatrix(i, wx_in, wy_in);
     if (i.kind == gpu.Kind.texture) if (gpu.affine(i)) |m| {
         // The map's inverse, about the pivot: back into the box's own
         // coordinates. A map that flattens the box to a line shows nothing.
         const det = m[0] * m[3] - m[1] * m[2];
         if (@abs(det) < 1e-9) return .{ -1e9, -1e9 };
-        const dx = wx - i.xf[2];
-        const dy = wy - i.xf[3];
+        const dx = p[0] - i.xf[2];
+        const dy = p[1] - i.xf[3];
         return .{ i.xf[2] + (m[3] * dx - m[1] * dy) / det, i.xf[3] + (-m[2] * dx + m[0] * dy) / det };
     };
     const a = i.xf[0];
-    if (a == 0) return .{ wx, wy };
-    const dx = wx - i.xf[2];
-    const dy = wy - i.xf[3];
+    if (a == 0) return p;
+    const dx = p[0] - i.xf[2];
+    const dy = p[1] - i.xf[3];
     const ca = @cos(a);
     const sa = @sin(a);
     return .{ i.xf[2] + ca * dx + sa * dy, i.xf[3] - sa * dx + ca * dy };
@@ -243,6 +260,22 @@ fn bounds(out: gpu.Pixels, i: *const gpu.Instance, scale: f32) ?[4]usize {
             const dy = ys[k] - py;
             const tx = px + m[0] * dx + m[1] * dy;
             const ty = py + m[2] * dx + m[3] * dy;
+            rx0 = @min(rx0, tx);
+            ry0 = @min(ry0, ty);
+            rx1 = @max(rx1, tx);
+            ry1 = @max(ry1, ty);
+        }
+    }
+    if (gpu.hasMatrix(i)) {
+        const xs = [4]f32{ rx0, rx1, rx0, rx1 };
+        const ys = [4]f32{ ry0, ry0, ry1, ry1 };
+        rx0 = 1e9;
+        ry0 = 1e9;
+        rx1 = -1e9;
+        ry1 = -1e9;
+        for (xs, ys) |x, y| {
+            const tx = i.m[0] * x + i.m[2] * y + i.mt[0];
+            const ty = i.m[1] * x + i.m[3] * y + i.mt[1];
             rx0 = @min(rx0, tx);
             ry0 = @min(ry0, ty);
             rx1 = @max(rx1, tx);
@@ -392,7 +425,8 @@ fn quad(out: gpu.Pixels, i: *const gpu.Instance, gradients: []const [4]f32, scal
     const corner_ext: f32 = if (r > 0) 1.52866495 * r else r_abs;
     const solid = @max(corner_ext, if (has_border) bw else 0) + 2 / scale;
     const inv = 1 / scale;
-    const rot = i.xf[0] != 0;
+    const local_px = pixelAt(i, inv);
+    const rot = i.xf[0] != 0 or gpu.hasMatrix(i);
     for (b[1]..b[3]) |y| {
         const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
         const row = y * out.width * 4;
@@ -414,7 +448,7 @@ fn quad(out: gpu.Pixels, i: *const gpu.Instance, gradients: []const [4]f32, scal
                 continue;
             }
             const sd = cornerSdf(pxl, py, hw, hh, r);
-            const aa = @max(sd[1] * inv, 0.0001) * 0.5;
+            const aa = @max(sd[1] * local_px, 0.0001) * 0.5;
             const coverage = 1 - smoothstep(-aa, aa, sd[0]);
             if (coverage <= 0) continue;
             // Premultiplied: the border is laid over the fill (shader.metal).
@@ -461,7 +495,7 @@ fn glyph(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, scale: f32, b: [4]
     if (mask.size == 0) return;
     const inv = 1 / scale;
     const c = i.color;
-    const rot = i.xf[0] != 0;
+    const rot = i.xf[0] != 0 or gpu.hasMatrix(i);
     for (b[1]..b[3]) |y| {
         const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
         const row = y * out.width * 4;
@@ -550,7 +584,11 @@ fn shadow(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void
             const py = up[1] - cy;
             var a = shapes.shadowAlpha(pxl, py, hw, hh, r, sigma) * c[3] * clipCover(i, wx, wy, inv);
             // Knocked out: nothing inside the box (`uv` its offset from the shadow's rect).
-            if (i.kind == gpu.Kind.shadow_out) a *= std.math.clamp(cornerSdf(pxl - i.uv[0], py - i.uv[1], hw, hh, r)[0] + 0.5, 0, 1);
+            if (i.kind == gpu.Kind.shadow_out) {
+                const s = i.uv[2];
+                const rb: f32 = if (r < 0) -@max(-r - s, 0) else @max(r - s, 0);
+                a *= std.math.clamp(cornerSdf(pxl - i.uv[0], py - i.uv[1], @max(hw - s, 0), @max(hh - s, 0), rb)[0] + 0.5, 0, 1);
+            }
             if (a > 0) a = std.math.clamp(a + shapes.shadowDither(x, y), 0, 1);
             blend(out.bytes, row + x * 4, c[0] * a, c[1] * a, c[2] * a, a);
         }

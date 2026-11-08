@@ -59,9 +59,10 @@ pub fn picture(out: gpu.Pixels, i: *const gpu.Instance, p: Source, scale: f32, b
     const hh = i.rect[3] * 0.5;
     const r_abs = @min(@abs(i.radius), @min(hw, hh));
     const r: f32 = if (i.radius < 0) -r_abs else r_abs;
-    // Turned, or mapped (`gpu.affine`): the box's own coordinates decide
+    // Turned, mapped (`gpu.affine`) or under a plane transform
+    // (`Instance.m`): the box's own coordinates decide
     // what is inside it, not the pixel's.
-    const rot = i.xf[0] != 0 or gpu.affine(i) != null;
+    const rot = i.xf[0] != 0 or gpu.affine(i) != null or gpu.hasMatrix(i);
     for (b[1]..b[3]) |y| {
         const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
         const row = y * out.width * 4;
@@ -73,7 +74,7 @@ pub fn picture(out: gpu.Pixels, i: *const gpu.Instance, p: Source, scale: f32, b
             const ty = (up[1] - i.rect[1]) / i.rect[3];
             const v = i.uv[1] + (i.uv[3] - i.uv[1]) * ty;
             const sd = raster.cornerSdf(up[0] - i.rect[0] - hw, up[1] - i.rect[1] - hh, hw, hh, r);
-            const aa = @max(sd[1] * inv, 0.0001) * 0.5;
+            const aa = @max(sd[1] * raster.pixelAt(i, inv), 0.0001) * 0.5;
             const k = (1 - raster.smoothstep(-aa, aa, sd[0])) * i.color[3] * raster.clipCover(i, wx, wy, inv);
             if (k <= 0) continue;
             const t = samplePicture(p, i.uv[0] + (i.uv[2] - i.uv[0]) * tx, v);

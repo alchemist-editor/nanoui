@@ -146,6 +146,8 @@ pub const FocusedText = struct {
     /// While composing: where the input method's selected clause (or the
     /// marked text) starts, in view points, for its candidate window.
     clause_rect: ?types.Rect = null,
+    /// The selection's two ends in order, line-tall, when it has one.
+    ends: ?[2]types.Rect = null,
 };
 
 /// Where copied text goes: the system's clipboard, or the Tester's own.
@@ -266,6 +268,11 @@ pub const Input = struct {
     /// Mac, Control elsewhere.
     pub fn adding(i: Input) bool {
         return if (comptime @import("keys.zig").mac) i.cmd else i.ctrl;
+    }
+
+    /// Keyboard activity, including IME text operations and offered shortcuts.
+    pub fn hasKeyboardInput(i: Input) bool {
+        return i.key != null or i.chars.len > 0 or i.ops.len > 0 or i.shortcut != null;
     }
 
     pub fn clearEdges(i: *Input) void {

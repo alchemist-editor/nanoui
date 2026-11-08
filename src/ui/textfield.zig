@@ -96,6 +96,8 @@ pub const Options = struct {
     placeholder: []const u8 = "",
     width: types.Length = .{ .px = 240 },
     size: f32 = 14,
+    weight: types.Weight = .regular,
+    mono: bool = false,
     /// Shows bullets instead of the text, and keeps it off the clipboard.
     password: bool = false,
     /// Text that would follow what is typed, drawn faintly after it, as a
@@ -304,7 +306,7 @@ const bullets = "•••••••••••••••••••••
 
 pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
     const th = c.theme;
-    const style: types.TextStyle = .{ .size = opts.size, .line_height = opts.line_height };
+    const style: types.TextStyle = .{ .size = opts.size, .weight = opts.weight, .line_height = opts.line_height, .mono = opts.mono };
     const pad_x: f32 = if (opts.bare) 0 else 10;
     const pad_y: f32 = if (opts.bare) 2 else 7;
     const multi = opts.multiline and !opts.password;
@@ -312,7 +314,9 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
         .direction = if (multi) .column else .row,
         .width = opts.width,
         .padding = .xy(pad_x, pad_y),
-        .radius = 8,
+        // A bare field sits in its app's frame: with no box of its own, a
+        // rounded clip would only cut the caret at its first and last line.
+        .radius = if (opts.bare) 0 else 8,
         .background = if (opts.bare) null else th.surface,
         .border = if (opts.bare) null else th.border,
         .align_items = if (multi) .start else .center,
@@ -334,6 +338,7 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
     }
     const focus_t = c.animate(it.id, 0, if (it.focused) 1 else 0, 20);
     const n = c.node(i);
+    n.layout_dependent = multi and buffer.text().len > 0;
     if (!opts.bare) {
         n.style.border = th.border.mix(th.accent, focus_t);
         n.style.border_width = 1 + focus_t;
@@ -359,12 +364,7 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
             return buf[0..@min(count * 3, buf.len)];
         }
     }.f;
-    const shownIndex = struct {
-        fn f(s: []const u8, password: bool, i_: usize) usize {
-            if (!password) return i_;
-            return (std.unicode.utf8CountCodepoints(s[0..i_]) catch i_) * 3;
-        }
-    }.f;
+    const shownIndex = lines_mod.shownIndex;
 
     if (it.right_clicked) c.text_menu = true;
     if (it.focused) {
@@ -388,11 +388,11 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
                 }
             } else if (c.input.pressed and c.input.button == .left and !c.input.ctrl and it.hovered) {
                 const idx = c.text.indexAt(shownOf(buffer.text(), opts.password, bullets), style, local_x);
-                const at = if (opts.password) byteOfCodepoint(buffer.text(), idx / 3) else idx;
+                const at = if (opts.password) lines_mod.byteOfCodepoint(buffer.text(), idx / 3) else idx;
                 textedit.pointerSelect(c, e, buffer.text(), at, false);
             } else if (e.selecting and c.input.down) {
                 const idx = c.text.indexAt(shownOf(buffer.text(), opts.password, bullets), style, local_x);
-                const at = if (opts.password) byteOfCodepoint(buffer.text(), idx / 3) else idx;
+                const at = if (opts.password) lines_mod.byteOfCodepoint(buffer.text(), idx / 3) else idx;
                 textedit.pointerDrag(c, e, buffer.text(), at, false);
             }
             if (!c.input.down) e.selecting = false;
@@ -494,6 +494,7 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
                 .anchor = e.anchor,
                 .marked = e.marked,
                 .caret_rect = .{ .x = r.x + pad_x + d.caret.x, .y = r.y + pad_y + d.caret.y, .w = opts.caret.width, .h = lh_ },
+                .ends = if (e.caret != e.anchor) lines_mod.ends(c, s, style, lines, @min(e.caret, e.anchor), @max(e.caret, e.anchor), r.x + pad_x, r.y + pad_y - e.scroll_y, lh_) else null,
             };
         }
         return result;
@@ -554,16 +555,13 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
             .marked = e.marked,
             .caret_rect = .{ .x = r.x + pad_x + caret_x - e.scroll_x, .y = r.y + (r.h - lh) / 2, .w = opts.caret.width, .h = lh },
             .clause_rect = clause,
+            .ends = if (hi > lo) .{
+                .{ .x = r.x + pad_x - e.scroll_x + c.text.caretX(shown, style, shownIndex(s, opts.password, lo)), .y = r.y + (r.h - lh) / 2, .w = 0, .h = lh },
+                .{ .x = r.x + pad_x - e.scroll_x + c.text.caretX(shown, style, shownIndex(s, opts.password, hi)), .y = r.y + (r.h - lh) / 2, .w = 0, .h = lh },
+            } else null,
         };
     }
     return result;
-}
-
-fn byteOfCodepoint(s: []const u8, n: usize) usize {
-    var i: usize = 0;
-    var k: usize = 0;
-    while (i < s.len and k < n) : (k += 1) i += utf8.seqLen(s[i]);
-    return @min(i, s.len);
 }
 
 pub const rehome = textedit.rehome;
