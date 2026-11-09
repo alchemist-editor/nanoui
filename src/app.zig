@@ -27,9 +27,6 @@ pub const Options = struct {
     on_continue_activity: ?*const fn (ctx: ?*anyopaque, url: []const u8) void = null,
     /// The app became active (true) or stopped being active.
     on_active: ?*const fn (ctx: ?*anyopaque, active: bool) void = null,
-    /// The Dock icon, as PNG bytes: a bare executable (a dev build, no
-    /// bundle) shows it instead of the generic one. Not when hidden.
-    icon_png: ?[]const u8 = null,
     /// What the About panel (the menu's `.about` role, `showAbout`) shows.
     about: extras.About = .{},
     /// `.accessory`: a menu bar app (a tray, `LSUIElement`), with no Dock
@@ -162,7 +159,6 @@ pub const App = struct {
         _ = objc.msg(objc.BOOL, nsapp, "setActivationPolicy:", .{activationPolicy(flags.hidden, options.activation)});
         objc.msg(void, nsapp, "setDelegate:", .{delegate});
         try self.setMenu(&default_menu);
-        if (options.icon_png) |png| if (!flags.hidden and options.activation == .regular) extras.setIcon(nsapp, png);
         return self;
     }
 
@@ -173,7 +169,7 @@ pub const App = struct {
 
     /// The standard About panel, with `Options.about`'s name, version and icon.
     pub fn showAbout(self: *App) void {
-        extras.showAbout(self.nsapp, self.options.about, self.options.name, self.options.icon_png);
+        extras.showAbout(self.nsapp, self.options.about, self.options.name);
     }
 
     /// Adds a file to the system's recent documents (Open Recent, the

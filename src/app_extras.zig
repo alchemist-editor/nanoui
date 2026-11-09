@@ -14,7 +14,8 @@ pub const About = struct {
     /// The build, in parentheses after the version.
     build: ?[]const u8 = null,
     copyright: ?[]const u8 = null,
-    /// The icon, as PNG bytes (null: `Options.icon_png`, else the app's own).
+    /// The icon, as PNG bytes (null: the app's own, as the Dock shows it:
+    /// a bundle's, or `WindowOptions.icon`).
     icon_png: ?[]const u8 = null,
 };
 
@@ -52,9 +53,9 @@ pub fn image(bytes: []const u8) ?objc.Object {
     return objc.msg(?objc.Object, objc.alloc("NSImage"), "initWithData:", .{data});
 }
 
-/// The About panel's options for `about`, the app named `name`, its icon
-/// `icon_png` unless `about` has its own. Autoreleased.
-pub fn aboutOptions(about: About, name: []const u8, icon_png: ?[]const u8) objc.Object {
+/// The About panel's options for `about`, the app named `name` (the app's
+/// own icon unless `about` has one). Autoreleased.
+pub fn aboutOptions(about: About, name: []const u8) objc.Object {
     const dict = objc.msg(objc.Object, objc.class("NSMutableDictionary"), "dictionary", .{});
     const put = struct {
         fn f(d: objc.Object, key: []const u8, value: objc.Object) void {
@@ -66,7 +67,7 @@ pub fn aboutOptions(about: About, name: []const u8, icon_png: ?[]const u8) objc.
     // An empty build hides AppKit's "(CFBundleVersion)" when there's none.
     put(dict, "Version", objc.nsString(about.build orelse ""));
     if (about.copyright) |c| put(dict, "Copyright", objc.nsString(c));
-    if (about.icon_png orelse icon_png) |png| if (image(png)) |img| {
+    if (about.icon_png) |png| if (image(png)) |img| {
         put(dict, "ApplicationIcon", img);
         objc.release(img);
     };
@@ -74,19 +75,10 @@ pub fn aboutOptions(about: About, name: []const u8, icon_png: ?[]const u8) objc.
 }
 
 /// Shows the standard About panel with `about`'s options.
-pub fn showAbout(nsapp: objc.Object, about: About, name: []const u8, icon_png: ?[]const u8) void {
+pub fn showAbout(nsapp: objc.Object, about: About, name: []const u8) void {
     const pool = objc.Pool.push();
     defer pool.pop();
-    objc.msg(void, nsapp, "orderFrontStandardAboutPanelWithOptions:", .{aboutOptions(about, name, icon_png)});
-}
-
-/// The Dock icon (and the app's in alerts) from PNG bytes.
-pub fn setIcon(nsapp: objc.Object, png: []const u8) void {
-    const pool = objc.Pool.push();
-    defer pool.pop();
-    const img = image(png) orelse return;
-    defer objc.release(img);
-    objc.msg(void, nsapp, "setApplicationIconImage:", .{img});
+    objc.msg(void, nsapp, "orderFrontStandardAboutPanelWithOptions:", .{aboutOptions(about, name)});
 }
 
 /// Adds the file at `path` to the system's recent documents (File ▸ Open
@@ -128,7 +120,7 @@ test "the About panel's options: name, version, build and icon" {
     var px = [_]u8{ 0, 0, 255, 255 };
     const png = try @import("ui/png.zig").encode(std.testing.allocator, .{ .bytes = &px, .width = 1, .height = 1 });
     defer std.testing.allocator.free(png);
-    const d = aboutOptions(.{ .version = "2.1.0", .build = "42" }, "Alchemist", png);
+    const d = aboutOptions(.{ .version = "2.1.0", .build = "42", .icon_png = png }, "Alchemist");
     const get = struct {
         fn f(dict: objc.Object, key: []const u8) ?objc.Object {
             return objc.msg(?objc.Object, dict, "objectForKey:", .{objc.nsString(key)});
@@ -138,7 +130,7 @@ test "the About panel's options: name, version, build and icon" {
     try std.testing.expectEqualStrings("2.1.0", objc.fromNSString(get(d, "ApplicationVersion")));
     try std.testing.expectEqualStrings("42", objc.fromNSString(get(d, "Version")));
     try std.testing.expect(get(d, "ApplicationIcon") != null);
-    try std.testing.expect(get(aboutOptions(.{}, "Alchemist", null), "ApplicationIcon") == null);
+    try std.testing.expect(get(aboutOptions(.{}, "Alchemist"), "ApplicationIcon") == null);
 }
 
 test "addRecentDocument takes a file and leaves nothing behind" {
