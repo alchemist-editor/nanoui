@@ -12,6 +12,7 @@ const Surface = @import("surface.zig").Surface;
 const drop = @import("surface_drop.zig");
 const link_pace = @import("surface_pacing.zig");
 const keys = @import("surface_keys.zig");
+const pointer_press = @import("pointer_press.zig");
 
 pub const methods = [_]objc.Method{
     .{ .name = "isFlipped", .imp = &yes, .types = "c@:" },
@@ -126,10 +127,23 @@ fn resignFirstResponder(obj: objc.Object, _: objc.SEL) callconv(.c) objc.BOOL {
     return objc.YES;
 }
 
+/// The buttons held, for the press guard; tests set it, since a made-up
+/// event leaves `+[NSEvent pressedMouseButtons]` as the real mouse has it.
+pub var held_override: ?pointer_press.Held = null;
+
+fn heldButtons() pointer_press.Held {
+    if (held_override) |h| return h;
+    // Bit 0 the left button, 1 the right, 2 the middle.
+    const bits = objc.msg(objc.NSUInteger, objc.class("NSEvent"), "pressedMouseButtons", .{});
+    return .{ .left = bits & 1 != 0, .right = bits & 2 != 0, .middle = bits & 4 != 0 };
+}
+
 /// A press of `button`: the view takes the keyboard, the box under the
-/// pointer the press.
+/// pointer the press. Another button's press while one is in flight is
+/// ignored (`pointer_press.starts`).
 fn press(obj: objc.Object, event: objc.Object, button: input.Button) void {
     const s = surfaceOf(obj) orelse return;
+    if (!pointer_press.starts(&s.ctx.input, button, heldButtons())) return;
     _ = objc.msg(objc.BOOL, s.window.nswindow, "makeFirstResponder:", .{obj});
     setMouse(s, event);
     s.ctx.updateHot();
@@ -165,7 +179,7 @@ fn press(obj: objc.Object, event: objc.Object, button: input.Button) void {
 fn release(obj: objc.Object, event: objc.Object, button: input.Button) void {
     const s = surfaceOf(obj) orelse return;
     // Another button's release, or one whose press went elsewhere.
-    if (s.ctx.input.button != button or !s.ctx.input.down) return;
+    if (!pointer_press.ends(&s.ctx.input, button)) return;
     setMouse(s, event);
     s.ctx.updateHot();
     s.ctx.pointerUp();
