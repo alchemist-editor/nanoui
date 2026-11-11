@@ -142,6 +142,8 @@ pub const Surface = struct {
         if (text.portable and !window.app.flags.hidden) self.text.enablePersistence(window.app.options.name);
         self.ctx = .init(gpa, &self.text);
         self.ctx.waker = .{ .ctx = self, .wake = thread_wake.fromContext };
+        // `keyUp:` reaches the view (surface_keys.zig).
+        self.ctx.key_up_supported = true;
         // Pictures go straight to the GPU before any view callback can run a frame.
         self.text.images.sink = .{ .ctx = &self.renderer, .upload = @import("metal.zig").Renderer.uploadImage };
         self.refreshAppearance();

@@ -1,7 +1,7 @@
 //! NanoUIView's keys: key combinations offered to the view first (as
 //! `input.shortcut`), Tab's focus traversal, the focused text field's
-//! input system, then plain keys and typed text; the modifier keys alone;
-//! Paste; and the menu bar's key equivalents held back while a view
+//! input system, then plain keys and typed text; keys let go
+//! (`input.key_up`); the modifier keys alone; Paste; and the menu bar's key equivalents held back while a view
 //! captures chords (`keys.suspendMenuKeyEquivalents`).
 const std = @import("std");
 const objc = @import("../objc.zig");
@@ -14,6 +14,7 @@ const setMods = @import("surface_events.zig").setMods;
 
 pub const methods = [_]objc.Method{
     .{ .name = "keyDown:", .imp = &keyDown, .types = "v@:@" },
+    .{ .name = "keyUp:", .imp = &keyUp, .types = "v@:@" },
     .{ .name = "flagsChanged:", .imp = &flagsChanged, .types = "v@:@" },
     .{ .name = "paste:", .imp = &paste, .types = "v@:@" },
     .{ .name = "performKeyEquivalent:", .imp = &performKeyEquivalent, .types = "c@:@" },
@@ -26,6 +27,26 @@ fn surfaceOf(obj: objc.Object) ?*Surface {
 fn keyDown(obj: objc.Object, _: objc.SEL, event: objc.Object) callconv(.c) void {
     const s = surfaceOf(obj) orelse return;
     deliver(s, event);
+}
+
+/// A key let go: a frame with `input.key_up`. AppKit sends no `keyUp:`
+/// for a key pressed with Command held (NSApplication keeps it), so a ⌘
+/// chord's key is never seen let go; the modifiers alone come to
+/// `flagsChanged:`.
+fn keyUp(obj: objc.Object, _: objc.SEL, event: objc.Object) callconv(.c) void {
+    const s = surfaceOf(obj) orelse return;
+    const tok = s.token();
+    const code = objc.msg(u16, event, "keyCode", .{});
+    const in = &s.ctx.input;
+    setMods(in, objc.msg(objc.NSUInteger, event, "modifierFlags", .{}));
+    const ign = objc.fromNSString(objc.msg(?objc.Object, event, "charactersIgnoringModifiers", .{}));
+    if (ign.len == 0) return;
+    const cp = std.unicode.utf8Decode(ign[0..@min(ign.len, cf.seqLen(ign[0]))]) catch return;
+    const key = shortcutKey(event, code, cp, in.shift);
+    in.key_up = .{ .key = key, .cmd = in.cmd, .ctrl = in.ctrl, .alt = in.alt, .shift = in.shift };
+    s.frame();
+    if (!Surface.alive(tok)) return;
+    in.key_up = null;
 }
 
 /// While the menu's key equivalents are held back, a ⌘ chord meant for
@@ -65,6 +86,12 @@ pub fn deliver(s: *Surface, event: objc.Object) void {
     const flags = objc.msg(objc.NSUInteger, event, "modifierFlags", .{});
     const in = &s.ctx.input;
     setMods(in, flags);
+    // Every frame this press runs says so (each frame clears its edges).
+    const repeat = objc.msg(objc.BOOL, event, "isARepeat", .{}) != objc.NO;
+    in.repeat = repeat;
+    defer if (Surface.alive(tok)) {
+        in.repeat = false;
+    };
     // Key combinations go to the view first, which may take them; while an
     // input method composes, only ⌘'s do (↓, Space, Esc, Tab are its).
     // With no text field focused every key is offered, with its modifiers
@@ -83,6 +110,7 @@ pub fn deliver(s: *Surface, event: objc.Object) void {
             s.frame();
             if (!Surface.alive(tok)) return;
             in.shortcut = null;
+            in.repeat = repeat;
             if (s.ctx.shortcut_taken) return;
             if (in.cmd and !in.ctrl and !in.alt and !in.shift) switch (key) {
                 'c' => return textinput.copy(s),
@@ -121,6 +149,7 @@ pub fn deliver(s: *Surface, event: objc.Object) void {
     }
     in.chars = buf[0..n];
     if (in.key == null and n == 0) return;
+    in.repeat = repeat;
     s.frame();
 }
 

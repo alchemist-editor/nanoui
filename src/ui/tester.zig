@@ -266,6 +266,14 @@ pub const Tester = struct {
         t.frame();
     }
 
+    /// A key let go, as a window's `keyUp:` or WM_KEYUP. A view that holds
+    /// keys reads them only where `ctx.key_up_supported`, which a test sets.
+    pub fn keyUp(t: *Tester, s: ctx_mod.Shortcut) void {
+        t.ctx.input.key_up = s;
+        t.frame();
+        t.ctx.input.key_up = null;
+    }
+
     pub fn scroll(t: *Tester, x: f32, y: f32, dy: f32) void {
         t.ctx.input.mouse = .{ .x = x, .y = y };
         if (t.ctx.applyScroll(dy)) {

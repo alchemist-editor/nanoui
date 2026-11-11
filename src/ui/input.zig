@@ -261,6 +261,16 @@ pub const Input = struct {
     ops: []const TextOp = &.{},
     /// A key combination offered in this event (`Context.shortcut`).
     shortcut: ?Shortcut = null,
+    /// A key let go in this event, named as `shortcut` names keys
+    /// (characters lowered, `Shortcut.left`, `Shortcut.f(n)`), with the
+    /// modifiers held then. Only where `Context.key_up_supported` says
+    /// the host reports them (macOS, Windows); the modifier keys alone
+    /// come as `mods_changed`. AppKit sends no key-up for a key pressed
+    /// with Command held, so a key held with ⌘ is never seen let go.
+    key_up: ?Shortcut = null,
+    /// This event's key press (`key`, `shortcut`, `chars`) is the system's
+    /// auto-repeat of a held key.
+    repeat: bool = false,
     shift: bool = false,
     cmd: bool = false,
     ctrl: bool = false,
@@ -294,5 +304,7 @@ pub const Input = struct {
         i.chars = "";
         i.ops = &.{};
         i.shortcut = null;
+        i.key_up = null;
+        i.repeat = false;
     }
 };

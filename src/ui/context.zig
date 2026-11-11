@@ -180,6 +180,10 @@ pub const Context = struct {
     copy_done: bool = false,
     /// Set when the view took the offered shortcut: it goes no further.
     shortcut_taken: bool = false,
+    /// The host reports key-ups (`input.key_up`): macOS and Windows. False
+    /// in the `Tester` (a test that holds keys sets it) and on hosts that
+    /// never send them, where a key seen down can't be trusted to be held.
+    key_up_supported: bool = false,
     /// Set by the focused text field each frame, along with caret blink and selection state.
     focused_text: ?FocusedText = null,
     focused_multiline: bool = false,
