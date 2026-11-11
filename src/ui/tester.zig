@@ -274,6 +274,13 @@ pub const Tester = struct {
         t.ctx.input.key_up = null;
     }
 
+    /// The keyboard goes elsewhere, as when a window loses focus: a frame
+    /// with `input.keys_released`, the modifiers up.
+    pub fn releaseKeys(t: *Tester) void {
+        t.ctx.input.releaseKeys();
+        t.frame();
+    }
+
     pub fn scroll(t: *Tester, x: f32, y: f32, dy: f32) void {
         t.ctx.input.mouse = .{ .x = x, .y = y };
         if (t.ctx.applyScroll(dy)) {

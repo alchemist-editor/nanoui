@@ -320,6 +320,10 @@ pub const WM_SYSCHAR = 0x0106;
 pub const WM_TIMER = 0x0113;
 /// The window became, or stopped being, the active application.
 pub const WM_ACTIVATEAPP = 0x001C;
+/// A modal loop takes over (a message box, a dialog): capture and keys go.
+pub const WM_CANCELMODE = 0x001F;
+/// A menu's modal loop begins (the window menu, F10, TrackPopupMenu).
+pub const WM_ENTERMENULOOP = 0x0211;
 pub const WM_SHOWWINDOW = 0x0018;
 /// The display's resolution or color depth changed.
 pub const WM_DISPLAYCHANGE = 0x007E;

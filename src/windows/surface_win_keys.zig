@@ -1,7 +1,8 @@
 //! A Windows surface's keys that are not text: the named keys, and the
 //! combinations offered to the menus' accelerators, the text field's
 //! editing shortcuts and the view (`surface.zig` hands them over); keys
-//! let go (`input.key_up`), the modifier keys alone (`mods_changed`), and
+//! let go (`input.key_up`), all of them when the keyboard goes elsewhere
+//! (`input.keys_released`), the modifier keys alone (`mods_changed`), and
 //! what Alt leaves to the system (Alt+F4, Alt+Space, the window menu).
 const std = @import("std");
 const w = @import("win32.zig");
@@ -18,6 +19,16 @@ pub fn readMods(self: *Surface) void {
     in.cmd = false;
     in.ctrl = w.GetKeyState(0x11) < 0;
     in.alt = w.GetKeyState(0x12) < 0;
+}
+
+/// The keyboard went elsewhere (focus or activation lost, a menu's or a
+/// dialog's modal loop): the key-ups of keys held go there, Alt's after
+/// Alt+Tab among them. The next frame has `input.keys_released`, the
+/// modifiers up, and Alt's gestures forgotten.
+pub fn releaseKeys(self: *Surface) void {
+    self.ctx.input.releaseKeys();
+    self.alt_used = false;
+    self.sys_taken = false;
 }
 
 fn isAlt(vk: u32) bool {

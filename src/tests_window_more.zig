@@ -1,8 +1,9 @@
 //! More of the Mac window, never shown: windows opened while the app runs
 //! (a second window from a menu) and closed by the app with `on_close`
 //! told; the frame; keys as the view gets them (Shift+1 as '1' with
-//! Shift, a bare letter), keys let go and auto-repeat, the menu's key
-//! equivalents held back for a view that captures chords.
+//! Shift, a bare letter), keys let go (Command's too, which AppKit drops),
+//! all of them when the window stops being key, and auto-repeat; the
+//! menu's key equivalents held back for a view that captures chords.
 const std = @import("std");
 const testing = std.testing;
 const objc = @import("objc.zig");
@@ -15,6 +16,7 @@ const Keys = struct {
     up: ?ui.Shortcut = null,
     repeated: bool = false,
     supported: bool = false,
+    released: u32 = 0,
     take: bool = true,
     closed: u32 = 0,
     frames: u32 = 0,
@@ -23,6 +25,7 @@ const Keys = struct {
         k.frames += 1;
         k.supported = c.key_up_supported;
         if (c.input.key_up) |u| k.up = u;
+        if (c.input.keys_released) k.released += 1;
         if (c.input.shortcut) |s| {
             k.got = s;
             k.repeated = c.input.repeat;
@@ -132,6 +135,28 @@ test "keyUp: the view sees the key let go, with its modifiers" {
     k.up = null;
     objc.msg(void, view, "keyUp:", .{keyEventOf(11, 123, 0, "\u{F702}", "\u{F702}", objc.NO)});
     try testing.expectEqual(ui.Shortcut.left, k.up.?.key);
+}
+
+test "a key let go with Command held reaches the view; resigning key lets every key go" {
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    var k: Keys = .{};
+    const w = try app.newWindow(.{ .title = "cmd-up", .width = 200, .height = 120, .visible = false, .content = .{ .view = .init(&k, Keys.view) } });
+    const surface_keys = @import("ui/surface_keys.zig");
+    // L held, then ⌘ pressed, then L let go: the key-up carries Command.
+    try testing.expect(surface_keys.sendCommandKeyUp(w.nswindow, keyEventOf(11, 37, cmd, "l", "l", objc.NO)));
+    const u = k.up orelse return error.NoKeyUp;
+    try testing.expectEqual(@as(u21, 'l'), u.key);
+    try testing.expect(u.cmd);
+    // One without Command goes AppKit's own way.
+    try testing.expect(!surface_keys.sendCommandKeyUp(w.nswindow, keyEventOf(11, 37, 0, "l", "l", objc.NO)));
+    const s = w.surface.?;
+    s.ctx.input.shift = true;
+    surface_keys.keyWindowChanged(s, false);
+    try testing.expectEqual(@as(u32, 1), k.released);
+    try testing.expect(!s.ctx.input.shift and !s.ctx.input.keys_released);
 }
 
 test "a repeated keyDown: sets input.repeat" {

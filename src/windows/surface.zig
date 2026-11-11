@@ -338,7 +338,13 @@ pub const Surface = struct {
             w.WM_ERASEBKGND => return 1,
             w.WM_SETFOCUS, w.WM_KILLFOCUS, w.WM_ACTIVATEAPP => {
                 self.ctx.input.window_active = if (msg == w.WM_ACTIVATEAPP) wp != 0 and self.window.isFocused() else msg == w.WM_SETFOCUS;
+                if (self.ctx.input.window_active) keys.readMods(self) else keys.releaseKeys(self);
                 self.frame();
+            },
+            w.WM_ENTERMENULOOP, w.WM_CANCELMODE => {
+                keys.releaseKeys(self);
+                self.frame();
+                return null;
             },
             w.WM_SHOWWINDOW => if (wp != 0) self.requestFrame(),
             w.WM_DISPLAYCHANGE => {

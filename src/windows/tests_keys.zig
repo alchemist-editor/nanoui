@@ -1,6 +1,7 @@
 //! A hidden Windows surface's key messages: keys let go (WM_KEYUP), the
-//! auto-repeat bit, the modifier keys alone, and what Alt leaves to
-//! DefWindowProc (Alt+F4, the window menu, WM_SYSCHAR's beep).
+//! auto-repeat bit, the modifier keys alone, every key let go when the
+//! keyboard goes elsewhere, and what Alt leaves to DefWindowProc (Alt+F4,
+//! the window menu, WM_SYSCHAR's beep).
 const std = @import("std");
 const testing = std.testing;
 const ui = @import("../ui/ui.zig");
@@ -11,10 +12,12 @@ const Seen = struct {
     up: ?ui.Shortcut = null,
     repeat: bool = false,
     mods: u32 = 0,
+    released: u32 = 0,
 
     fn view(s: *Seen, c: *ui.Context) void {
         if (c.input.key_up) |u| s.up = u;
         if (c.input.mods_changed) s.mods += 1;
+        if (c.input.keys_released) s.released += 1;
         if (c.input.key != null) s.repeat = c.input.repeat;
         ui.text(c, "keys", .{});
     }
@@ -73,4 +76,15 @@ test "key messages: a key let go, the repeat bit, modifiers alone, Alt's system 
     s.sys_taken = true;
     try testing.expectEqual(@as(?w.LRESULT, 0), s.handle(h, w.WM_SYSCHAR, '1', 0x20020001));
     try testing.expect(!s.sys_taken);
+
+    // Alt+Tab away: the keys and Alt's gestures are let go, in.alt with them.
+    s.ctx.input.alt = true;
+    s.alt_used = true;
+    _ = s.handle(h, w.WM_KILLFOCUS, 0, 0);
+    try testing.expectEqual(@as(u32, 1), seen.released);
+    try testing.expect(!s.ctx.input.alt and !s.alt_used and !s.ctx.input.keys_released);
+    // A menu's or a dialog's modal loop does the same, and DefWindowProc runs.
+    try testing.expectEqual(@as(?w.LRESULT, null), s.handle(h, w.WM_ENTERMENULOOP, 0, 0));
+    try testing.expectEqual(@as(?w.LRESULT, null), s.handle(h, w.WM_CANCELMODE, 0, 0));
+    try testing.expectEqual(@as(u32, 3), seen.released);
 }
