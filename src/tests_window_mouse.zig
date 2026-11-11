@@ -1,7 +1,8 @@
 //! The Mac window's mouse buttons, never shown: the middle button
 //! (`otherMouseDown:` with button number 2) as a press of its own, and
 //! one press at a time, so another button's press while one is held is
-//! ignored, and so is its release.
+//! ignored, and so is its release; a press whose release is still queued
+//! is not stale.
 const std = @import("std");
 const testing = std.testing;
 const objc = @import("objc.zig");
@@ -117,4 +118,63 @@ test "mouse buttons: a middle press is its own, and a second button mid-press is
     objc.msg(void, view, "mouseDown:", .{try mouseEvent(1)});
     try testing.expect(s.ctx.input.button == .left and s.ctx.input.down);
     try testing.expectEqual(@as(u32, 4), seen.presses);
+}
+
+/// The app's next queued event of `mask`, taken off the queue.
+fn takeQueued(mask: objc.NSUInteger) ?objc.Object {
+    const nsapp = objc.msg(objc.Object, objc.class("NSApplication"), "sharedApplication", .{});
+    const past = objc.msg(objc.Object, objc.class("NSDate"), "distantPast", .{});
+    return objc.msg(?objc.Object, nsapp, "nextEventMatchingMask:untilDate:inMode:dequeue:", .{ mask, past, objc.nsString(events.peek_mode), objc.YES });
+}
+
+fn drainLeftUps() void {
+    while (takeQueued(1 << 2) != null) {}
+}
+
+test "mouse buttons: a press whose release is still queued is not stale" {
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    const app = try makeApp(testing.allocator);
+    defer freeApp(app);
+    var seen: Seen = .{};
+    const win = try app.newWindow(.{ .title = "mouse", .width = 200, .height = 120, .visible = false, .content = .{ .view = .init(&seen, Seen.view) } });
+    const s = win.surface.?;
+    const view = s.nsview;
+    defer events.held_override = null;
+    const nsapp = objc.msg(objc.Object, objc.class("NSApplication"), "sharedApplication", .{});
+    // Nothing of ours left in the queue, whatever happens.
+    defer drainLeftUps();
+
+    // A left drag in flight.
+    events.held_override = .{ .left = true };
+    objc.msg(void, view, "mouseDown:", .{try mouseEvent(1)});
+    try testing.expect(seen.button == .left and s.ctx.input.down);
+
+    // A slow frame: the middle button went down, then the left came up,
+    // and both wait in the queue. As the middle press is handled the
+    // mouse already says the left is up, but its release is behind it:
+    // the middle press is ignored, the left drag goes on.
+    objc.msg(void, nsapp, "postEvent:atStart:", .{ try mouseEvent(2), objc.NO });
+    events.held_override = .{ .middle = true };
+    objc.msg(void, view, "otherMouseDown:", .{try mouseEvent(25)});
+    try testing.expectEqual(@as(u32, 1), seen.presses);
+    try testing.expect(s.ctx.input.button == .left and s.ctx.input.down);
+
+    // The queued release reaches the view and ends the left drag; the
+    // middle button's release then ends nothing.
+    const up = takeQueued(1 << 2) orelse return error.NotQueued;
+    objc.msg(void, view, "mouseUp:", .{up});
+    try testing.expect(!s.ctx.input.down);
+    try testing.expectEqual(@as(u32, 1), seen.releases);
+    events.held_override = .{};
+    objc.msg(void, view, "otherMouseUp:", .{try mouseEvent(26)});
+    try testing.expectEqual(@as(u32, 1), seen.releases);
+
+    // With no release queued, the same press is stale and gives way.
+    events.held_override = .{ .left = true };
+    objc.msg(void, view, "mouseDown:", .{try mouseEvent(1)});
+    events.held_override = .{ .middle = true };
+    objc.msg(void, view, "otherMouseDown:", .{try mouseEvent(25)});
+    try testing.expect(s.ctx.input.button == .middle and s.ctx.input.down);
+    try testing.expectEqual(@as(u32, 3), seen.presses);
 }

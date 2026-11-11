@@ -22,6 +22,14 @@ pub const Held = packed struct(u8) {
             .middle => h.middle,
         };
     }
+
+    pub fn set(h: *Held, b: input.Button) void {
+        switch (b) {
+            .left => h.left = true,
+            .right => h.right = true,
+            .middle => h.middle = true,
+        }
+    }
 };
 
 /// Whether a press of `button` starts a press. It does when none is in
@@ -81,6 +89,11 @@ test "pointer press: a stale press (its button no longer held, or pressed again)
     try testing.expect(starts(&middle, .middle, .{ .middle = true }));
     const left = inFlight(.left);
     try testing.expect(starts(&left, .left, .{ .left = true }));
+    // Held again (its release is still on its way): the new press waits.
+    var h: Held = .{ .middle = true };
+    h.set(.left);
+    try testing.expect(h.has(.left) and h.has(.middle) and !h.has(.right));
+    try testing.expect(!starts(&left, .middle, h));
 }
 
 test "pointer press: cancel lets the press go with no release edge" {

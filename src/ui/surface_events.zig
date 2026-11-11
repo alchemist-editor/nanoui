@@ -131,11 +131,42 @@ fn resignFirstResponder(obj: objc.Object, _: objc.SEL) callconv(.c) objc.BOOL {
 /// event leaves `+[NSEvent pressedMouseButtons]` as the real mouse has it.
 pub var held_override: ?pointer_press.Held = null;
 
-fn heldButtons() pointer_press.Held {
-    if (held_override) |h| return h;
-    // Bit 0 the left button, 1 the right, 2 the middle.
-    const bits = objc.msg(objc.NSUInteger, objc.class("NSEvent"), "pressedMouseButtons", .{});
-    return .{ .left = bits & 1 != 0, .right = bits & 2 != 0, .middle = bits & 4 != 0 };
+/// The buttons held as a press arrives. `+[NSEvent pressedMouseButtons]`
+/// is the mouse as it is now, not when the event was made: a button let
+/// go after this press, its release still queued behind it (a slow
+/// frame), already reads as up. So the press in flight counts as held
+/// while its release waits in the queue, and is stale only when that
+/// release went elsewhere (a drag session's, a menu's or a modal's loop
+/// took it).
+fn heldButtons(in: *const input.Input) pointer_press.Held {
+    var h = held_override orelse live: {
+        // Bit 0 the left button, 1 the right, 2 the middle.
+        const bits = objc.msg(objc.NSUInteger, objc.class("NSEvent"), "pressedMouseButtons", .{});
+        break :live pointer_press.Held{ .left = bits & 1 != 0, .right = bits & 2 != 0, .middle = bits & 4 != 0 };
+    };
+    if (in.down and !h.has(in.button) and releaseQueued(in.button)) h.set(in.button);
+    return h;
+}
+
+/// The run loop mode the queue is peeked in: no source or timer is
+/// registered in it, so the peek runs nothing.
+pub const peek_mode = "NanoUIPressPeek";
+
+/// Whether a release of `button` waits in the app's event queue, peeked
+/// without taking it.
+fn releaseQueued(button: input.Button) bool {
+    const pool = objc.Pool.push();
+    defer pool.pop();
+    // NSEventMaskLeftMouseUp, RightMouseUp, OtherMouseUp.
+    const mask: objc.NSUInteger = switch (button) {
+        .left => 1 << 2,
+        .right => 1 << 4,
+        .middle => 1 << 26,
+    };
+    const nsapp = objc.msg(objc.Object, objc.class("NSApplication"), "sharedApplication", .{});
+    const past = objc.msg(objc.Object, objc.class("NSDate"), "distantPast", .{});
+    const ev = objc.msg(?objc.Object, nsapp, "nextEventMatchingMask:untilDate:inMode:dequeue:", .{ mask, past, objc.nsString(peek_mode), objc.NO });
+    return ev != null;
 }
 
 /// A press of `button`: the view takes the keyboard, the box under the
@@ -143,7 +174,7 @@ fn heldButtons() pointer_press.Held {
 /// ignored (`pointer_press.starts`).
 fn press(obj: objc.Object, event: objc.Object, button: input.Button) void {
     const s = surfaceOf(obj) orelse return;
-    if (!pointer_press.starts(&s.ctx.input, button, heldButtons())) return;
+    if (!pointer_press.starts(&s.ctx.input, button, heldButtons(&s.ctx.input))) return;
     _ = objc.msg(objc.BOOL, s.window.nswindow, "makeFirstResponder:", .{obj});
     setMouse(s, event);
     s.ctx.updateHot();
