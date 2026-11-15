@@ -122,8 +122,9 @@ fn convert(gpa: std.mem.Allocator, t: gpu.Texture, u: color.Uniforms, src: *cons
             const rgb = color.linearToDisplay(.{ c[0], c[1], c[2] }, u);
             c = .{ rgb[0], rgb[1], rgb[2], 1 };
         } else if (u.source_mode == 4) {
+            // Alpha kept, as the shader keeps it.
             const rgb = color.surfaceLinearToSdr(.{ c[0], c[1], c[2] });
-            c = .{ rgb[0], rgb[1], rgb[2], 1 };
+            c = .{ rgb[0], rgb[1], rgb[2], c[3] };
         }
         const graded = color.applyLuts(t, .{ c[0], c[1], c[2] });
         const o = out[(y * w + x) * 4 ..][0..4];

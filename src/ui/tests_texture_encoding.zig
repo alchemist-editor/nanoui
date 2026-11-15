@@ -307,3 +307,66 @@ test "texture encodings: an app's RGBA16F and RGB10A2 textures of display codes 
     defer objc.release(@ptrCast(lin_tex));
     try expectDrawn(.{ .width = n, .height = n, .mtl_texture = lin_tex, .encoding = .surface_linear, .lut = invert }, encodedAt);
 }
+
+/// Draws `source` (`n` × `n`, in a window 8 pixels wider) with Metal and on
+/// the CPU: every channel, alpha's effect included, within one 8-bit step
+/// of the other. A texel transparent in column 0 must show the background
+/// (the pixel right of the texture) on both.
+fn expectSameOverBackground(source: ui.Texture) !void {
+    const gpa = testing.allocator;
+    var s: Scene = .{ .source = source };
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&s, Scene.view), .{ .width = n + 8, .height = n, .scale = 1 });
+    defer t.deinit();
+    t.settle(0.1);
+    const shown = try t.render(gpa);
+    defer shown.deinit(gpa);
+    const cpu: gpu.Pixels = .{ .bytes = try gpa.alloc(u8, shown.bytes.len), .width = shown.width, .height = shown.height };
+    defer cpu.deinit(gpa);
+    var pictures = t.text.images.pictures();
+    pictures.textures = t.ctx.textures.items;
+    raster.draw(cpu, t.instances.items, .{ .pixels = &.{}, .size = 0 }, pictures, t.scale, t.theme.background);
+    var worst: f32 = 0;
+    for (0..n) |y| for (0..n) |x| for (0..4) |k| {
+        const i = (y * shown.width + x) * 4 + k;
+        worst = @max(worst, @abs(@as(f32, @floatFromInt(shown.bytes[i])) - @as(f32, @floatFromInt(cpu.bytes[i]))));
+    };
+    if (worst > 1) std.debug.print("worst: Metal vs CPU {d:.3} steps\n", .{worst});
+    try testing.expect(worst <= 1);
+    const bg = (n + 4) * 4;
+    for (0..n) |y| for (0..3) |k| {
+        const row = y * shown.width * 4;
+        try testing.expectEqual(shown.bytes[row + bg + k], shown.bytes[row + k]);
+        try testing.expectEqual(cpu.bytes[row + bg + k], cpu.bytes[row + k]);
+    };
+}
+
+test "texture encodings: alpha is kept, through an sRGB pixel format and through mode 4, on Metal as on the CPU" {
+    if (text.portable) return error.SkipZigTest;
+    const objc = @import("../objc.zig");
+    // Premultiplied display codes: column 0 transparent, then alpha rising.
+    var bgra: [n * n * 4]u8 = undefined;
+    for (0..n) |y| for (0..n) |x| {
+        const a: u32 = @intCast(x * 255 / (n - 1));
+        const c = codeAt(x, y);
+        var px: [4]u8 = undefined;
+        for (0..3) |k| px[2 - k] = @intCast(@as(u32, color.unorm8(c[k])) * a / 255);
+        px[3] = @intCast(a);
+        bgra[(y * n + x) * 4 ..][0..4].* = px;
+    };
+    const srgb_tex = try appTexture(81, &bgra, n * 4);
+    defer objc.release(@ptrCast(srgb_tex));
+    try expectSameOverBackground(.{ .width = n, .height = n, .mtl_texture = srgb_tex, .encoding = .display_sdr, .lut = invert });
+    try expectSameOverBackground(.{ .width = n, .height = n, .mtl_texture = srgb_tex, .encoding = .surface_linear });
+    // Linear light, premultiplied, in half floats: mode 4 keeps its alpha.
+    var lin: [n * n * 8]u8 = undefined;
+    for (0..n) |y| for (0..n) |x| {
+        const a = @as(f32, @floatFromInt(x)) / (n - 1);
+        const l = linearAt(x, y);
+        const v = [4]f32{ l[0] * a, l[1] * a, l[2] * a, a };
+        for (0..4) |k| std.mem.writeInt(u16, lin[(y * n + x) * 8 + k * 2 ..][0..2], @bitCast(@as(f16, @floatCast(v[k]))), .little);
+    };
+    const lin_tex = try appTexture(115, &lin, n * 8);
+    defer objc.release(@ptrCast(lin_tex));
+    try expectSameOverBackground(.{ .width = n, .height = n, .mtl_texture = lin_tex, .encoding = .surface_linear });
+}

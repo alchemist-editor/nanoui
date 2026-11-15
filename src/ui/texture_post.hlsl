@@ -101,7 +101,7 @@ float4 alc_post_ps(float4 pos : SV_Position) : SV_Target {
         color = float4(linear_to_srgb(saturate(l3)), 1.0);
     }
     // Linear light for the surface, on an SDR one: clipped and encoded, no tone map.
-    if (sourceMode == 4u) color = float4(linear_to_srgb(saturate(color.rgb)), 1.0);
+    if (sourceMode == 4u) color = float4(linear_to_srgb(saturate(color.rgb)), color.a);
     if (sourceLutEnabled == 1u) color = float4(apply_cube_source(color.rgb, sourceDomainMin.rgb, sourceDomainMax.rgb, sourceLutSize), color.a);
     if (lutEnabled == 0u) return color;
     return float4(apply_cube_lut(color.rgb, domainMin.rgb, domainMax.rgb, lutSize), color.a);

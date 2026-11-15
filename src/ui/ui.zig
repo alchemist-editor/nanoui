@@ -170,10 +170,8 @@ pub const VideoRange = @import("gpu.zig").Range;
 pub const VideoMatrix = @import("gpu.zig").Matrix;
 pub const VideoTransfer = @import("gpu.zig").Transfer;
 /// What an app's RGB texture already is (`Texture.encoding`), for apps
-/// that manage colour themselves; a surface's colour and its display's.
+/// that manage colour themselves.
 pub const TextureEncoding = @import("gpu.zig").Encoding;
-pub const SurfaceColour = @import("gpu.zig").SurfaceColour;
-pub const DisplayInfo = @import("gpu.zig").DisplayInfo;
 /// A 3D LUT for a texture's colour stage (`ui.lut`).
 pub const Lut = @import("gpu.zig").Lut;
 pub const lut = @import("ui_gpu.zig").lut;

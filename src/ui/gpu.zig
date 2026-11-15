@@ -203,33 +203,15 @@ pub const Encoding = enum {
     /// As `format`, `transfer`, `tone_map` and the LUTs say.
     auto,
     /// Already encoded for this surface (display sRGB on an SDR one),
-    /// premultiplied: sampled as stored, whatever its pixel format (BGRA8,
-    /// RGBA16F, RGB10A2).
+    /// premultiplied: sampled as stored, alpha included, whatever its pixel
+    /// format (BGRA8, RGBA16F, RGB10A2, or an sRGB one, whose decoded
+    /// samples are encoded again).
     display_sdr,
     /// Linear light in Rec. 709 primaries, SDR white at 1.0, values above
     /// it kept: never tone mapped. An SDR surface shows it clamped to
-    /// [0, 1] and sRGB encoded (the colour stage's source mode 4), opaque.
+    /// [0, 1] and sRGB encoded (the colour stage's source mode 4), its
+    /// alpha kept.
     surface_linear,
-};
-
-/// What a window's surface shows its pixels as: display sRGB (every
-/// surface today), or extended-range linear light (SDR white 1.0, values
-/// above it brighter, on displays with headroom).
-pub const SurfaceColour = enum { sdr_srgb, extended_linear };
-
-/// What the display under a surface can show. The defaults describe an
-/// SDR display, which is what a surface that can't tell reports.
-pub const DisplayInfo = struct {
-    /// How far above SDR white the display can go now, and at most
-    /// (1 for an SDR display).
-    headroom_now: f32 = 1,
-    headroom_potential: f32 = 1,
-    /// SDR white and the display's peak, in nits.
-    sdr_white_nits: f32 = 100,
-    max_nits: f32 = 100,
-    /// Whether the output is HDR, and the display's gamut wider than sRGB.
-    hdr_output: bool = false,
-    wide_gamut: bool = false,
 };
 
 /// What a texture's pixels are: BGRA (display sRGB, premultiplied), two-

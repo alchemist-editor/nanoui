@@ -56,8 +56,9 @@ fragment float4 alc_post_fs(float4 pos [[position]], constant PostUniforms& u [[
         if (u.hdrToneMap == 1u) lin = lin / (1.0 + lin);
         color = float4(alc_linear_to_srgb(clamp(lin, 0.0, 1.0)), 1.0);
     }
-    // Linear light for the surface, on an SDR one: clipped and encoded, no tone map.
-    if (u.sourceMode == 4u) color = float4(alc_linear_to_srgb(clamp(color.rgb, 0.0, 1.0)), 1.0);
+    // Linear light for the surface, on an SDR one: clipped and encoded, no
+    // tone map. Its alpha is kept (premultiplied, as the app stored it).
+    if (u.sourceMode == 4u) color = float4(alc_linear_to_srgb(clamp(color.rgb, 0.0, 1.0)), color.a);
     if (u.sourceLutEnabled == 1u) color = float4(alc_apply_cube(color.rgb, u.sourceDomainMin.rgb, u.sourceDomainMax.rgb, u.sourceLutSize, sourceLut, lutSampler), color.a);
     if (u.lutEnabled == 0u) return color;
     return float4(alc_apply_cube(color.rgb, u.domainMin.rgb, u.domainMax.rgb, u.lutSize, lut, lutSampler), color.a);
