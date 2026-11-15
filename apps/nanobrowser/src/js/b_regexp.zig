@@ -13,6 +13,7 @@ const PropKey = u.PropKey;
 const Object = u.Object;
 const PropFlags = u.PropFlags;
 const objmod = @import("object.zig");
+const shape = @import("shape.zig");
 const props = @import("props.zig");
 const conv = @import("conv.zig");
 const ops = @import("ops.zig");
@@ -45,16 +46,22 @@ const cache_max = 512;
 fn programFor(vm: *Vm, pattern: *JSString, flags: *JSString) Error!*rc.Program {
     const pb = try pattern.flat(vm);
     const fb = try flags.flat(vm);
-    const key_bytes = try vm.gpa.alloc(u8, pb.len + fb.len + 1);
-    @memcpy(key_bytes[0..fb.len], fb);
-    key_bytes[fb.len] = '/';
-    @memcpy(key_bytes[fb.len + 1 ..], pb);
-    if (vm.regex_cache.get(key_bytes)) |p| {
-        vm.gpa.free(key_bytes);
+    const key_len = pb.len + fb.len + 1;
+    var stack_key: [256]u8 = undefined;
+    var heap_key: ?[]u8 = null;
+    defer if (heap_key) |hk| vm.gpa.free(hk);
+    const lookup_key: []u8 = if (key_len <= stack_key.len) stack_key[0..key_len] else blk: {
+        const hk = try vm.gpa.alloc(u8, key_len);
+        heap_key = hk;
+        break :blk hk;
+    };
+    @memcpy(lookup_key[0..fb.len], fb);
+    lookup_key[fb.len] = '/';
+    @memcpy(lookup_key[fb.len + 1 .. key_len], pb);
+    if (vm.regex_cache.get(lookup_key)) |p| {
         p.refs += 1;
         return p;
     }
-    errdefer vm.gpa.free(key_bytes);
     const f = rp.Flags.parse(fb) orelse return vm.throwError(.SyntaxError, "Invalid flags supplied to RegExp constructor");
     var cps: std.ArrayList(u32) = .empty;
     defer cps.deinit(vm.gpa);
@@ -73,9 +80,15 @@ fn programFor(vm: *Vm, pattern: *JSString, flags: *JSString) Error!*rc.Program {
             return vm.throwError(.SyntaxError, m);
         },
     };
+    errdefer prog.release(vm.gpa);
     if (vm.regex_cache.count() >= cache_max) clearCache(vm);
+    const owned_key = if (heap_key) |hk| blk: {
+        heap_key = null;
+        break :blk hk;
+    } else try vm.gpa.dupe(u8, lookup_key);
+    errdefer vm.gpa.free(owned_key);
+    try vm.regex_cache.put(vm.gpa, owned_key, prog);
     prog.refs += 1;
-    try vm.regex_cache.put(vm.gpa, key_bytes, prog);
     return prog;
 }
 
@@ -95,9 +108,13 @@ pub fn create(vm: *Vm, pattern: *JSString, flags: *JSString, proto: *Object) Err
     const d = try vm.gpa.create(RegExpData);
     errdefer vm.gpa.destroy(d);
     d.* = .{ .source = pattern, .flags = flags, .prog = prog };
-    const o = try objmod.create(vm, proto, .regexp);
+    const sh = if (proto == vm.protos.regexp)
+        vm.regexp_shape
+    else
+        try shape.transition(vm, try shape.rootFor(vm, proto), vm.k.lastIndex, .{ .enumerable = false, .configurable = false });
+    const o = try objmod.alloc(vm, sh, .regexp);
     o.payload = .{ .regexp = d };
-    try props.addProp(vm, o, vm.k.lastIndex, Value.fromInt(0), .{ .enumerable = false, .configurable = false });
+    o.slots[0] = Value.fromInt(0);
     return o.value();
 }
 
@@ -146,8 +163,27 @@ pub fn matchAt(vm: *Vm, prog: *const rc.Program, s: *JSString, start: usize, sti
     };
 }
 
-fn setLastIndex(vm: *Vm, o: *Object, n: usize) Error!void {
+pub fn setLastIndex(vm: *Vm, o: *Object, n: usize) Error!void {
+    if (o.class == .regexp and o.shape.count >= 1) {
+        const flags = o.shape.table.entries.items[0].flags;
+        if (flags.writable and !flags.accessor) {
+            o.slots[0] = Value.fromUsize(n);
+            return;
+        }
+    }
     try props.put(vm, o, vm.k.lastIndex, Value.fromUsize(n));
+}
+
+pub inline fn isFastRegExp(vm: *Vm, o: *Object) bool {
+    return o.class == .regexp and !o.shape.is_dict and o.shape.count == 1 and o.shape.proto == vm.protos.regexp and !vm.protos.regexp.flags.proto_dirty;
+}
+
+pub fn hasBuiltinExec(vm: *Vm, o: *Object) bool {
+    if (isFastRegExp(vm, o)) return true;
+    if (o.class != .regexp or o.shape.count != 1 or o.shape.proto != vm.protos.regexp) return false;
+    const slot = vm.protos.regexp.shape.find(vm.k.exec) orelse return false;
+    const flags = vm.protos.regexp.shape.flagsAt(slot);
+    return !flags.accessor and vm.protos.regexp.slots[slot].isObject() and vm.protos.regexp.slots[slot].asObject() == vm.protos.regexp_exec;
 }
 
 fn matchIndicesArray(vm: *Vm, regs: []const i32, ncaps: u32, names: []const rp.GroupName) Error!Value {
@@ -174,12 +210,36 @@ fn matchIndicesArray(vm: *Vm, regs: []const i32, ncaps: u32, names: []const rp.G
     return arr.value();
 }
 
+/// Fast boolean match for RegExp.prototype.test without allocating a match Array.
+pub fn builtinTest(vm: *Vm, o: *Object, s: *JSString) Error!bool {
+    const d = o.payload.regexp;
+    const prog = d.prog;
+    const f = prog.flags;
+    const li: usize = if (o.slots[0].isInt()) @intCast(@max(0, o.slots[0].asInt())) else try conv.toLength(vm, o.slots[0]);
+    const uses_last = f.global or f.sticky;
+    const start = if (uses_last) li else 0;
+    if (start > s.len16) {
+        if (uses_last) try setLastIndex(vm, o, 0);
+        return false;
+    }
+    const total = prog.ncaps * 2 + prog.nregs;
+    var stack_regs: [64]i32 = undefined;
+    const regs = if (total <= stack_regs.len) stack_regs[0..total] else try vm.gpa.alloc(i32, total);
+    defer if (total > stack_regs.len) vm.gpa.free(regs);
+    if (!try matchAt(vm, prog, s, start, f.sticky, regs)) {
+        if (uses_last) try setLastIndex(vm, o, 0);
+        return false;
+    }
+    if (uses_last) try setLastIndex(vm, o, @intCast(regs[1]));
+    return true;
+}
+
 /// RegExpBuiltinExec: a match array, or null.
 pub fn builtinExec(vm: *Vm, o: *Object, s: *JSString) Error!Value {
     const d = o.payload.regexp;
     const prog = d.prog;
     const f = prog.flags;
-    const li = try conv.toLength(vm, o.slots[0]);
+    const li: usize = if (o.slots[0].isInt()) @intCast(@max(0, o.slots[0].asInt())) else try conv.toLength(vm, o.slots[0]);
     const uses_last = f.global or f.sticky;
     const start = if (uses_last) li else 0;
     if (start > s.len16) {
@@ -187,27 +247,35 @@ pub fn builtinExec(vm: *Vm, o: *Object, s: *JSString) Error!Value {
         return Value.null;
     }
     const total = prog.ncaps * 2 + prog.nregs;
-    const regs = try vm.gpa.alloc(i32, total);
-    defer vm.gpa.free(regs);
+    var stack_regs: [64]i32 = undefined;
+    const regs = if (total <= stack_regs.len) stack_regs[0..total] else try vm.gpa.alloc(i32, total);
+    defer if (total > stack_regs.len) vm.gpa.free(regs);
     if (!try matchAt(vm, prog, s, start, f.sticky, regs)) {
         if (uses_last) try setLastIndex(vm, o, 0);
         return Value.null;
     }
     if (uses_last) try setLastIndex(vm, o, @intCast(regs[1]));
-    const arr = try objmod.newArray(vm, &.{});
-    try objmod.growElems(vm, arr, prog.ncaps);
+    const arr = try objmod.alloc(vm, vm.regexp_match_shape, .array);
+    if (!f.has_indices and prog.ncaps <= objmod.inline_slots - 3) {
+        arr.slot_cap = 3;
+        arr.elems = @as([*]Value, &arr.inline_store) + 3;
+        arr.elems_cap = objmod.inline_slots - 3;
+    } else {
+        try objmod.growElems(vm, arr, prog.ncaps);
+    }
     var i: u32 = 0;
     while (i < prog.ncaps) : (i += 1) {
         const a = regs[i * 2];
         const b = regs[i * 2 + 1];
-        if (a < 0 or b < 0) {
-            try objmod.arrayPush(vm, arr, Value.undefined);
-        } else {
-            try objmod.arrayPush(vm, arr, Value.fromString(try str.substring(vm, s, @intCast(a), @intCast(b))));
-        }
+        arr.elems[i] = if (a < 0 or b < 0)
+            Value.undefined
+        else
+            Value.fromString(try str.substring(vm, s, @intCast(a), @intCast(b)));
     }
-    try props.addProp(vm, arr, vm.k.index, Value.fromInt(regs[0]), PropFlags.all);
-    try props.addProp(vm, arr, vm.k.input, Value.fromString(s), PropFlags.all);
+    arr.elems_len = prog.ncaps;
+    arr.arr_len = prog.ncaps;
+    arr.slots[0] = Value.fromInt(regs[0]);
+    arr.slots[1] = Value.fromString(s);
     var groups = Value.undefined;
     if (prog.names.len != 0) {
         const g = try objmod.create(vm, null, .object);
@@ -217,7 +285,7 @@ pub fn builtinExec(vm: *Vm, o: *Object, s: *JSString) Error!Value {
         }
         groups = g.value();
     }
-    try props.addProp(vm, arr, vm.k.groups, groups, PropFlags.all);
+    arr.slots[2] = groups;
     if (f.has_indices) {
         try props.addProp(vm, arr, vm.k.indices, try matchIndicesArray(vm, regs, prog.ncaps, prog.names), PropFlags.all);
     }
@@ -226,6 +294,7 @@ pub fn builtinExec(vm: *Vm, o: *Object, s: *JSString) Error!Value {
 
 /// RegExpExec: honours a user-replaced exec method.
 pub fn regExpExec(vm: *Vm, o: *Object, s: *JSString) Error!Value {
+    if (hasBuiltinExec(vm, o)) return builtinExec(vm, o, s);
     const e = try props.get(vm, o, vm.k.exec);
     if (e.isCallable() and !(e.asObject() == vm.protos.regexp_exec and o.class == .regexp)) {
         const r = try calls.call(vm, e, o.value(), &.{Value.fromString(s)});
@@ -247,8 +316,17 @@ fn execFn(vm: *Vm, this: Value, args: []const Value) Error!Value {
 
 fn testFn(vm: *Vm, this: Value, args: []const Value) Error!Value {
     if (!this.isObject()) return vm.throwError(.TypeError, "RegExp.prototype.test called on non-object");
-    const r = try regExpExec(vm, this.asObject(), try conv.toStr(vm, u.arg(args, 0)));
-    return Value.fromBool(!r.isNull());
+    const o = this.asObject();
+    const s = try conv.toStr(vm, u.arg(args, 0));
+    if (hasBuiltinExec(vm, o)) return Value.fromBool(try builtinTest(vm, o, s));
+    const e = try props.get(vm, o, vm.k.exec);
+    if (e.isCallable() and !(e.asObject() == vm.protos.regexp_exec and o.class == .regexp)) {
+        const r = try calls.call(vm, e, o.value(), &.{Value.fromString(s)});
+        if (!r.isObject() and !r.isNull()) return vm.throwError(.TypeError, "object null or function expected");
+        return Value.fromBool(!r.isNull());
+    }
+    if (o.class != .regexp) return vm.throwError(.TypeError, "RegExp.prototype.exec called on incompatible receiver");
+    return Value.fromBool(try builtinTest(vm, o, s));
 }
 
 /// EscapeRegExpPattern for the source getter: a newline or bare slash must not appear raw.
@@ -299,9 +377,50 @@ fn sourceGet(vm: *Vm, this: Value, _: []const Value) Error!Value {
     return Value.fromString(try escapedSource(vm, (try thisRe(vm, this)).payload.regexp.source));
 }
 
+pub fn formatFlags(pf: rp.Flags, buf: *[8]u8) []const u8 {
+    var len: usize = 0;
+    if (pf.has_indices) {
+        buf[len] = 'd';
+        len += 1;
+    }
+    if (pf.global) {
+        buf[len] = 'g';
+        len += 1;
+    }
+    if (pf.ignore_case) {
+        buf[len] = 'i';
+        len += 1;
+    }
+    if (pf.multiline) {
+        buf[len] = 'm';
+        len += 1;
+    }
+    if (pf.dot_all) {
+        buf[len] = 's';
+        len += 1;
+    }
+    if (pf.unicode) {
+        buf[len] = 'u';
+        len += 1;
+    }
+    if (pf.unicode_sets) {
+        buf[len] = 'v';
+        len += 1;
+    }
+    if (pf.sticky) {
+        buf[len] = 'y';
+        len += 1;
+    }
+    return buf[0..len];
+}
+
 fn flagsGet(vm: *Vm, this: Value, _: []const Value) Error!Value {
     if (!this.isObject()) return vm.throwError(.TypeError, "RegExp.prototype.flags getter called on non-object");
     const o = this.asObject();
+    if (isFastRegExp(vm, o)) {
+        var buf: [8]u8 = undefined;
+        return Value.fromString(try str.fromUtf8(vm, formatFlags(o.payload.regexp.prog.flags, &buf)));
+    }
     var b = str.Builder.init(vm);
     defer b.deinit();
     const table = [_]struct { name: []const u8, c: u8 }{
@@ -355,6 +474,12 @@ fn compileFn(vm: *Vm, this: Value, args: []const Value) Error!Value {
 pub fn init(vm: *Vm) Error!void {
     const p = try u.newProto(vm, vm.protos.object);
     vm.protos.regexp = p;
+    vm.regexp_shape = try shape.transition(vm, try shape.rootFor(vm, p), vm.k.lastIndex, .{ .enumerable = false, .configurable = false });
+    var ms = vm.array_root;
+    ms = try shape.transition(vm, ms, vm.k.index, PropFlags.all);
+    ms = try shape.transition(vm, ms, vm.k.input, PropFlags.all);
+    ms = try shape.transition(vm, ms, vm.k.groups, PropFlags.all);
+    vm.regexp_match_shape = ms;
     const c = try u.ctor(vm, "RegExp", 2, regexpCtor, p);
     vm.protos.regexp_ctor = c;
     try u.symGetter(vm, c, vm.sym.species, "get [Symbol.species]", u.returnThis);
@@ -374,4 +499,6 @@ pub fn init(vm: *Vm) Error!void {
     try u.getter(vm, p, "sticky", flagGetter("sticky"));
     try u.getter(vm, p, "hasIndices", flagGetter("has_indices"));
     try sym.init(vm, p);
+    p.flags.is_proto = true;
+    p.flags.proto_dirty = false;
 }

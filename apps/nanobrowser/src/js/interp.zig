@@ -20,6 +20,7 @@ const slow = @import("interp_slow.zig");
 const icache = @import("interp_ic.zig");
 const calls = @import("interp_call.zig");
 const unwind = @import("interp_unwind.zig");
+const jit = @import("jit.zig");
 
 inline fn u16At(p: [*]const u8) u32 {
     return std.mem.readInt(u16, p[0..2], .little);
@@ -57,10 +58,26 @@ pub fn run(vm: *Vm) Error!Value {
     var sp: [*]Value = vm.sp;
     var argc: u32 = 0;
     var err: Error = error.Thrown;
-    while (true) {
+    loop: while (true) {
         dispatch: {
+            if (!f.is_entry and pc == f.fp.code.ptr and f.co == null) {
+                if (jit.getOrCompile(vm, f.fp)) |jfn| {
+                    const entry = f.is_entry;
+                    const r = ok(Value, jit.execFrame(vm, f, jfn, &sp), &err) orelse break :dispatch;
+                    if (entry) {
+                        vm.sp = sp;
+                        return r;
+                    }
+                    sp[0] = r;
+                    sp += 1;
+                    f = &vm.frames[vm.frame_top - 1];
+                    pc = f.pc;
+                    bp = f.bp;
+                }
+            }
             sw: switch (@as(Op, @fromBackingInt(@intCast(pc[0])))) {
                 .undef, .null_, .true_, .false_, .hole => |o| {
+                    @import("../perf_rules.zig").prof_interp_ops += 1;
                     sp[0] = literals[@backingInt(o) - @backingInt(Op.undef)];
                     sp += 1;
                     pc += 1;
@@ -160,7 +177,7 @@ pub fn run(vm: *Vm) Error!Value {
                 .get_global => {
                     const ic = &f.fp.ics[u32At(pc + 1)];
                     var v = Value.hole;
-                    if (ic.shape == vm.global_lex.shape and ic.holder_shape == vm.global_obj.shape and ic.holder != null) {
+                    if (ic.shape == vm.global_lex.shape and ic.holder_shape == vm.global_obj.shape and ic.holder != null and ic.epoch == vm.proto_epoch) {
                         v = ic.holder.?.slots[ic.slot];
                     }
                     if (v.isHole()) {
@@ -174,7 +191,7 @@ pub fn run(vm: *Vm) Error!Value {
                 },
                 .put_global => {
                     const ic = &f.fp.ics[u32At(pc + 1)];
-                    if (ic.shape == vm.global_lex.shape and ic.holder_shape == vm.global_obj.shape and ic.holder != null and !ic.holder.?.slots[ic.slot].isHole()) {
+                    if (ic.shape == vm.global_lex.shape and ic.holder_shape == vm.global_obj.shape and ic.holder != null and ic.epoch == vm.proto_epoch and !ic.holder.?.slots[ic.slot].isHole()) {
                         ic.holder.?.slots[ic.slot] = (sp - 1)[0];
                     } else {
                         sync(vm, f, pc, sp);
@@ -187,27 +204,15 @@ pub fn run(vm: *Vm) Error!Value {
                     const ic = &f.fp.ics[u32At(pc + 1)];
                     const v = (sp - 1)[0];
                     var r: Value = undefined;
-                    get: {
-                        if (v.isObject()) {
-                            const obj = v.asObject();
-                            if (obj.shape == ic.shape) {
-                                if (ic.holder) |h| {
-                                    if (h.shape == ic.holder_shape) {
-                                        r = h.slots[ic.slot];
-                                        break :get;
-                                    }
-                                } else {
-                                    r = obj.slots[ic.slot];
-                                    break :get;
-                                }
-                            }
-                        }
+                    if (v.isObject() and v.asObject().shape == ic.shape and ic.fast_own_data) {
+                        r = v.asObject().slots[ic.slot];
+                    } else if (v.isObject() and v.asObject().shape == ic.shape and ic.fast_proto_data and ic.epoch == vm.proto_epoch and ic.holder.?.shape == ic.holder_shape) {
+                        r = ic.holder.?.slots[ic.slot];
+                    } else {
                         sync(vm, f, pc, sp);
                         r = ok(Value, icache.getField(vm, ic, v), &err) orelse break :dispatch;
                     }
-                    if (o == .get_field) {
-                        (sp - 1)[0] = r;
-                    } else {
+                    if (o == .get_field) (sp - 1)[0] = r else {
                         sp[0] = r;
                         sp += 1;
                     }
@@ -218,7 +223,7 @@ pub fn run(vm: *Vm) Error!Value {
                     const ic = &f.fp.ics[u32At(pc + 1)];
                     const t = (sp - 2)[0];
                     const v = (sp - 1)[0];
-                    if (t.isObject() and t.asObject().shape == ic.shape and ic.holder == null) {
+                    if (t.isObject() and t.asObject().shape == ic.shape and ic.fast_own_data) {
                         t.asObject().slots[ic.slot] = v;
                     } else {
                         sync(vm, f, pc, sp);
@@ -388,17 +393,19 @@ pub fn run(vm: *Vm) Error!Value {
                     pc += 1;
                     continue :sw @fromBackingInt(@intCast(pc[0]));
                 },
-                inline .seq, .sne => |o| {
+                inline .seq, .sne, .eq, .ne => |o| {
                     const a = (sp - 2)[0];
                     const b = (sp - 1)[0];
                     var r: bool = undefined;
                     if (a.isInt() and b.isInt()) {
                         r = a.bits == b.bits;
+                    } else if ((o == .eq or o == .ne) and (a.isNullish() or b.isNullish())) {
+                        r = ops.nullishOrDda(a) and ops.nullishOrDda(b);
                     } else {
                         sync(vm, f, pc, sp);
-                        r = ok(bool, ops.strictEquals(vm, a, b), &err) orelse break :dispatch;
+                        r = ok(bool, if (o == .seq or o == .sne) ops.strictEquals(vm, a, b) else ops.looseEquals(vm, a, b), &err) orelse break :dispatch;
                     }
-                    (sp - 2)[0] = Value.fromBool(r == (o == .seq));
+                    (sp - 2)[0] = Value.fromBool(r == (o == .seq or o == .eq));
                     sp -= 1;
                     pc += 1;
                     continue :sw @fromBackingInt(@intCast(pc[0]));
@@ -425,6 +432,7 @@ pub fn run(vm: *Vm) Error!Value {
                 },
                 .loop => {
                     pc = jumpTo(pc + 5, relAt(pc + 1));
+                    f.fp.hot_count +|= 1;
                     vm.budget -= 1;
                     if (vm.budget <= 0) {
                         sync(vm, f, pc, sp);
@@ -471,7 +479,7 @@ pub fn run(vm: *Vm) Error!Value {
                         pc = f.pc;
                         bp = f.bp;
                         sp = vm.sp;
-                        continue :sw @fromBackingInt(@intCast(pc[0]));
+                        continue :loop;
                     }
                     const r = ok(Value, calls.callNonClosure(vm, callee, (sp - argc - 2)[0], (sp - argc)[0..argc]), &err) orelse break :dispatch;
                     sp -= argc + 1;
@@ -493,7 +501,7 @@ pub fn run(vm: *Vm) Error!Value {
                         pc = f.pc;
                         bp = f.bp;
                         sp = vm.sp;
-                        continue :sw @fromBackingInt(@intCast(pc[0]));
+                        continue :loop;
                     }
                     const r = ok(Value, calls.construct(vm, callee, (sp - argc)[0..argc], callee), &err) orelse break :dispatch;
                     sp -= argc + 1;

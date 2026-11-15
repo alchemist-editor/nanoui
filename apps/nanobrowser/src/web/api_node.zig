@@ -26,22 +26,23 @@ fn nodeType(vm: *Vm, this: Value, _: []const Value) Error!Value {
 }
 
 fn upperName(vm: *Vm, n: *const Node) Error!Value {
-    if (n.ns != .html) return vm.newString(n.tag);
+    if (n.ns != .html) return if (n.tag.len <= 32) vm.internString(n.tag) else vm.newString(n.tag);
     var buf: [128]u8 = undefined;
+    if (n.tag.len <= 32) return vm.internString(std.ascii.upperString(&buf, n.tag));
     if (n.tag.len <= buf.len) return vm.newString(std.ascii.upperString(&buf, n.tag));
     return vm.newString(n.tag);
 }
 
 fn nodeName(vm: *Vm, this: Value, _: []const Value) Error!Value {
     const n = try nodeOf(vm, this);
-    if (bind.isShadow(n)) return vm.newString("#document-fragment");
+    if (bind.isShadow(n)) return vm.internString("#document-fragment");
     return switch (n.kind) {
         .element => upperName(vm, n),
-        .text => vm.newString("#text"),
-        .comment => vm.newString("#comment"),
-        .document => vm.newString("#document"),
+        .text => vm.internString("#text"),
+        .comment => vm.internString("#comment"),
+        .document => vm.internString("#document"),
         .doctype => vm.newString(n.data),
-        .fragment => vm.newString("#document-fragment"),
+        .fragment => vm.internString("#document-fragment"),
     };
 }
 
@@ -78,10 +79,7 @@ fn setTextContent(vm: *Vm, this: Value, args: []const Value) Error!Value {
         try mutate.setData(w, n, s);
         return Value.undefined;
     }
-    // One record, replacing everything by one text.
-    const f = try w.page.doc.createFragment();
-    if (s.len > 0) f.appendChild(try n.doc.createText(s));
-    try mutate.replaceAllWith(w, n, f);
+    try mutate.replaceWithText(w, n, s);
     return Value.undefined;
 }
 
@@ -196,7 +194,27 @@ fn replaceChild(vm: *Vm, this: Value, args: []const Value) Error!Value {
 pub fn clone(w: *bind.World, n: *Node, deep: bool, doc: *dom.Document) Error!*Node {
     const a = doc.arena;
     const copy = try a.create(Node);
-    copy.* = .{ .kind = n.kind, .doc = doc, .tag = n.tag, .ns = n.ns, .data = n.data };
+    copy.* = .{
+        .kind = n.kind,
+        .doc = doc,
+        .tag = n.tag,
+        .html_tag = n.html_tag,
+        .ns = n.ns,
+        .data = n.data,
+        .has_resource = @import("../perf_rules.zig").isResourceTag(n.tag),
+        .has_id = n.id_attr != null and n.id_attr.?.len != 0,
+        .has_insertion_work = @import("../perf_rules.zig").isInsertionWorkTag(n.tag),
+        .has_on_attr = n.has_on_attr,
+        .id_attr = n.id_attr,
+        .class_attr = n.class_attr,
+        .class_filter = n.class_filter,
+        .attr_filter = n.attr_filter,
+        .subtree_class_bloom = n.class_filter,
+        .subtree_attr_bloom = n.attr_filter,
+        .class_src = n.class_src,
+        .class_src_len = n.class_src_len,
+        .class_single = n.class_single,
+    };
     try copy.attrs.ensureTotalCapacity(a, n.attrs.items.len);
     for (n.attrs.items) |at| copy.attrs.appendAssumeCapacity(at);
     copy.value = n.value;
@@ -219,7 +237,27 @@ pub fn clone(w: *bind.World, n: *Node, deep: bool, doc: *dom.Document) Error!*No
         while (true) {
             if (k) |child| {
                 const c2 = try a.create(Node);
-                c2.* = .{ .kind = child.kind, .doc = doc, .tag = child.tag, .ns = child.ns, .data = child.data };
+                c2.* = .{
+                    .kind = child.kind,
+                    .doc = doc,
+                    .tag = child.tag,
+                    .html_tag = child.html_tag,
+                    .ns = child.ns,
+                    .data = child.data,
+                    .has_resource = @import("../perf_rules.zig").isResourceTag(child.tag),
+                    .has_id = child.id_attr != null and child.id_attr.?.len != 0,
+                    .has_insertion_work = @import("../perf_rules.zig").isInsertionWorkTag(child.tag),
+                    .has_on_attr = child.has_on_attr,
+                    .id_attr = child.id_attr,
+                    .class_attr = child.class_attr,
+                    .class_filter = child.class_filter,
+                    .attr_filter = child.attr_filter,
+                    .subtree_class_bloom = child.class_filter,
+                    .subtree_attr_bloom = child.attr_filter,
+                    .class_src = child.class_src,
+                    .class_src_len = child.class_src_len,
+                    .class_single = child.class_single,
+                };
                 try c2.attrs.ensureTotalCapacity(a, child.attrs.items.len);
                 for (child.attrs.items) |at| c2.attrs.appendAssumeCapacity(at);
                 c2.value = child.value;
@@ -229,7 +267,7 @@ pub fn clone(w: *bind.World, n: *Node, deep: bool, doc: *dom.Document) Error!*No
                     c2.image = child.image;
                     c2.image_key = child.image_key;
                 }
-                to.appendChild(c2);
+                to.parserInsert(c2, null);
                 if (child.isTag("template")) {
                     if (collections.templateContent(w, child)) |t| c2.template_content = try clone(w, t, true, doc);
                 }

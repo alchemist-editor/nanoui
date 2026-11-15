@@ -90,10 +90,16 @@ pub const Deferred = union(enum) {
     submit: struct { form: *dom.Node, submitter: ?*dom.Node },
 };
 
+pub const DispatchPath = struct {
+    nodes: [128]*dom.Node = undefined,
+    len: u8 = 0,
+    has_win: bool = false,
+};
+
 pub const max_console = 1000;
 /// How long one task may run. A test may shorten it.
 pub var task_deadline_ns: u64 = 5 * std.time.ns_per_s;
-const first_collection = 48 << 20;
+const first_collection = 192 << 20;
 
 pub var log_to_stderr = false;
 
@@ -112,6 +118,7 @@ pub const World = struct {
 
     /// JS calls under way that came from the host.
     depth: u32 = 0,
+    task_t0: u64 = 0,
     /// Collect when the VM has passed this many bytes.
     gc_next: usize = first_collection,
     /// `location` asked to go here; done when the task ends.
@@ -168,6 +175,7 @@ pub const World = struct {
     exports: std.ArrayList(Value) = .empty,
     export_ids: std.AutoHashMapUnmanaged(*js.Object, u32) = .empty,
     imports: std.AutoHashMapUnmanaged(*js.Object, @import("api_frames.zig").Remote) = .empty,
+    import_by_remote: std.AutoHashMapUnmanaged(u64, *js.Object) = .empty,
     caller: ?*Page = null,
     /// `document.open()` is in force: what's been written since.
     doc_open: bool = false,
@@ -175,6 +183,11 @@ pub const World = struct {
     /// A control should take the keyboard, or none, at the next frame.
     focus_request: ?*dom.Node = null,
     blur_request: bool = false,
+    dispatch_paths: [8]DispatchPath = undefined,
+    dispatch_depth: u8 = 0,
+    rect_shape: ?*js.Shape = null,
+    rect_epoch: u32 = 0,
+    query_arena: std.heap.ArenaAllocator,
 
     pub fn create(p: *Page) !*World {
         const gpa = p.gpa;
@@ -182,7 +195,7 @@ pub const World = struct {
         errdefer gpa.destroy(w);
         const vm = try js.Vm.create(gpa);
         errdefer vm.deinit();
-        w.* = .{ .page = p, .gpa = gpa, .vm = vm, .started_ns = monotonic() };
+        w.* = .{ .page = p, .gpa = gpa, .vm = vm, .started_ns = monotonic(), .query_arena = std.heap.ArenaAllocator.init(gpa) };
         vm.setRootsHook(w, markRoots);
         vm.setRejectionHook(w, rejected);
         vm.setDynamicImportHook(w, modules.dynamicImport);
@@ -215,6 +228,8 @@ pub const World = struct {
         w.doc_written.deinit(gpa);
         w.export_ids.deinit(gpa);
         w.imports.deinit(gpa);
+        w.import_by_remote.deinit(gpa);
+        w.query_arena.deinit();
         if (w.pending_nav) |n| {
             gpa.free(n.url);
             gpa.free(n.body);
@@ -249,6 +264,7 @@ pub const World = struct {
         w.timers.mark(m);
         w.mods.mark(m);
         w.custom.mark(m);
+        if (w.rect_shape) |rs| m.markCell(&rs.cell);
     }
 
     /// Enters JS from the host. Every `enter` is matched by `leave`, which
@@ -257,19 +273,39 @@ pub const World = struct {
         if (w.depth == 0) {
             w.page.busy += 1;
             w.vm.setDeadline(task_deadline_ns);
+            if (w.caller == null) w.task_t0 = @import("../perf_rules.zig").nowNs();
         }
         w.depth += 1;
     }
 
     pub fn leave(w: *World) void {
+        w.leaveInner(w.caller);
+    }
+
+    pub fn leaveRemote(w: *World, prev_caller: ?*Page) void {
+        w.leaveInner(prev_caller);
+    }
+
+    fn leaveInner(w: *World, prev_caller: ?*Page) void {
         const vm = w.vm;
+        const caller_page = w.caller;
+        const has_caller = caller_page != null;
+        w.caller = prev_caller;
         // Microtasks are still this task: for them, JS is running.
-        if (w.depth == 1) vm.runJobs();
+        if (@import("../perf_rules.zig").isAgentMicrotaskCheckpoint(w.depth, has_caller)) {
+            w.drainAgentJobs();
+        }
         w.depth -= 1;
         if (w.depth != 0) return;
+        if (!has_caller and w.task_t0 != 0) {
+            @import("../perf_rules.zig").prof_js_task_ns += @import("../perf_rules.zig").nowNs() -| w.task_t0;
+            w.task_t0 = 0;
+        }
         vm.setDeadline(0);
-        if (vm.bytesAllocated() > w.gc_next) {
+        if (!has_caller and vm.bytesAllocated() > w.gc_next) {
+            const t0 = @import("../perf_rules.zig").nowNs();
             vm.collect();
+            @import("../perf_rules.zig").prof_gc_ns += @import("../perf_rules.zig").nowNs() -| t0;
             w.gc_next = @max(first_collection, vm.bytesAllocated() * 2);
         }
         const p = w.page;
@@ -284,12 +320,59 @@ pub const World = struct {
             w.pending_history = 0;
             p.host.history(p.host.ctx, p, by);
         }
-        if (w.redraw_due and !w.in_frame) {
-            w.redraw_due = false;
-            p.redraw();
+        if (w.redraw_due) {
+            if (caller_page) |cp| {
+                if (cp.js) |cw| {
+                    if (!w.in_frame) {
+                        w.redraw_due = false;
+                        w.redraw_asked = false;
+                    }
+                    cw.redraw_asked = true;
+                    if (cw.depth == 0 and !cw.in_frame) cp.redraw() else cw.redraw_due = true;
+                } else if (!w.in_frame) {
+                    w.redraw_due = false;
+                    w.redraw_asked = false;
+                    p.redraw();
+                }
+            } else if (!w.in_frame) {
+                w.redraw_due = false;
+                p.redraw();
+            }
         }
         p.busy -= 1;
         p.maybeFree();
+    }
+
+    fn drainAgentJobs(w: *World) void {
+        w.vm.runJobs();
+        const top = @import("../frames.zig").topOf(w.page);
+        if (top == w.page and top.frames.list.items.len == 0) return;
+        while (drainFrameTree(w, top)) {
+            w.vm.runJobs();
+        }
+    }
+
+    fn drainFrameTree(root: *World, p: *Page) bool {
+        if (p.dead) return false;
+        var ran = false;
+        if (p.js) |cw| if (cw != root and !cw.stopped) {
+            if (cw.vm.jobs_head < cw.vm.jobs.items.len or cw.vm.pending_rejections.items.len != 0) {
+                const was = cw.caller;
+                cw.caller = root.page;
+                cw.enter();
+                cw.vm.runJobs();
+                cw.leaveRemote(was);
+                ran = true;
+            }
+        };
+        if (p.dead) return ran;
+        var i: usize = 0;
+        while (i < p.frames.list.items.len) : (i += 1) {
+            if (p.frames.list.items[i].page) |child| {
+                if (drainFrameTree(root, child)) ran = true;
+            }
+        }
+        return ran;
     }
 
     /// Calls `f` as a task of its own. Holds the page while it runs, and the

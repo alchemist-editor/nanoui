@@ -135,6 +135,20 @@ fn applyClear(f: *Flow, s: *const css.Style, margin_top: f32) bool {
 /// Lays out an in-flow block-level box. True if it has fixed the position of
 /// what holds it, rather than being collapsed through.
 fn flowChild(f: *Flow, b: *Box, parent_left: f32, cx: f32, cw: f32, ch: ?f32) Error!bool {
+    if (b.lay.adopted and !ctx.isBfcRoot(b)) {
+        if (!f.floats.any() and b.lay.flow_reusable and b.lay.cached_flow_cw == cw and b.lay.cached_flow_ch == (ch orelse -1) and legacyAlign(b) == null and (b.parent == null or !b.parent.?.style.rtl)) {
+            b.w = b.lay.cached_out_w;
+            b.h = b.lay.cached_out_h;
+            b.x = parent_left + b.margin.left;
+            f.strut.add(b.margin.top);
+            f.settle();
+            b.y = f.y;
+            f.y = b.y + b.h;
+            f.fresh(b.margin.bottom);
+            return true;
+        }
+        try @import("cache.zig").unadopt(f.c, b);
+    }
     ctx.setEdges(b, cw);
     if (ctx.isBfcRoot(b)) return flowRoot(f, b, parent_left, cx, cw, ch);
     const c = f.c;
@@ -218,6 +232,14 @@ fn flowChild(f: *Flow, b: *Box, parent_left: f32, cx: f32, cw: f32, ch: ?f32) Er
     baselines(b);
     if (b.lay.has_marker) try list.place(c, b);
     b.lay.state_valid = false;
+    if (resolved and !f.floats.any() and legacyAlign(b) == null and (b.parent == null or !b.parent.?.style.rtl)) {
+        b.lay.cached_flow_cw = cw;
+        b.lay.cached_flow_ch = ch orelse -1;
+        b.lay.cached_out_w = b.w;
+        b.lay.cached_out_h = b.h;
+    } else {
+        b.lay.cached_flow_cw = -1;
+    }
     return resolved;
 }
 
@@ -280,7 +302,8 @@ fn rootWidth(c: *Ctx, b: *Box, cw: f32, ch: ?f32) Error!f32 {
 /// and `align` on what holds it; `margin: 0 auto` in all but name.
 fn legacyAlign(b: *const Box) ?css.TextAlign {
     const n = (b.parent orelse return null).node orelse return null;
-    if (n.isTag("center")) return .center;
+    if (n.tag.len == 6 and n.isTag("center")) return .center;
+    if ((n.attr_filter & comptime @import("../perf_rules.zig").attrBit("align")) == 0) return null;
     const name = n.attr("align") orelse return null;
     if (std.ascii.eqlIgnoreCase(name, "center") or std.ascii.eqlIgnoreCase(name, "middle")) return .center;
     if (std.ascii.eqlIgnoreCase(name, "right")) return .right;

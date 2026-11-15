@@ -37,8 +37,12 @@ cbuffer Params : register(b0) {
     float4 text_gamma;   // 80  DirectWrite's coverage correction
     float  text_contrast; // 96
     float  gray_contrast; // 100
-    float2 pad2;         // 104
-};                       // 112 bytes
+    float  classic_contrast; // 104 the same for GDI Classic glyphs
+    float  classic_gray_contrast; // 108
+    float4 progressive; // 112 sidebar blur: top, bottom, fade in texels
+    float4 classic_gamma; // 128
+    float4 classic_gray_gamma; // 144
+};                       // 160 bytes
 
 // One quad, byte-identical to shader.metal's `Instance` and to gpu.zig's.
 struct Instance {
@@ -327,10 +331,12 @@ float4 triangle_color(Varyings v) {
     return float4(v.i_color.rgb * alpha, alpha);
 }
 
-float text_coverage(float a, float intensity, float lightness, bool subpixel) {
-    float k = (subpixel ? text_contrast : gray_contrast) * clamp(3.0 - 4.0 * lightness, 0.0, 1.0);
+float text_coverage(float a, float intensity, float lightness, bool subpixel, bool classic) {
+    float4 gamma = classic ? (subpixel ? classic_gamma : classic_gray_gamma) : text_gamma;
+    float contrast = classic ? (subpixel ? classic_contrast : classic_gray_contrast) : (subpixel ? text_contrast : gray_contrast);
+    float k = contrast * clamp(3.0 - 4.0 * lightness, 0.0, 1.0);
     float v = a * (k + 1.0) / (a * k + 1.0);
-    float correction = (text_gamma[0] * intensity + text_gamma[1]) * v + text_gamma[2] * intensity + text_gamma[3];
+    float correction = (gamma[0] * intensity + gamma[1]) * v + gamma[2] * intensity + gamma[3];
     return clamp(v + v * (1.0 - v) * correction, 0.0, 1.0);
 }
 
@@ -348,17 +354,20 @@ Pixel glyph_pixel(Varyings v, float clip_cover) {
     float2 screen_pixels = v.i_rect.zw * scale;
     float2 atlas_texels = (v.i_uv.zw - v.i_uv.xy) * float2(side);
     bool one_to_one = all(abs(screen_pixels - atlas_texels) < float2(0.001, 0.001));
-    if (rgb_text > 0.5 && one_to_one) {
+    if (rgb_text != 0.0 && one_to_one) {
         // Native glyphs are nearest-sampled, as raster.zig does. The RGB
-        // texel's alpha is a tag: 1 ClearType, 128/255 native grayscale.
+        // texel's alpha is a tag: 255/254 Natural/Classic ClearType,
+        // 128/127 Natural/Classic native grayscale.
         int2 at = clamp(int2(v.v_uv * float2(side)), int2(0, 0), int2(side) - 1);
         float4 native = native_atlas.Load(int3(at, 0));
+        uint tag = (uint)round(native.a * 255.0);
+        bool classic = tag == 254 || tag == 127;
         float lightness = 0.30 * v.i_color.r + 0.59 * v.i_color.g + 0.11 * v.i_color.b;
-        if (native.a > 0.75) {
+        if (native.a > 0.75 && rgb_text > 0.5) {
             float3 coverage = float3(
-                text_coverage(native.r, v.i_color.r, lightness, true),
-                text_coverage(native.g, v.i_color.g, lightness, true),
-                text_coverage(native.b, v.i_color.b, lightness, true)) * opacity;
+                text_coverage(native.r, v.i_color.r, lightness, true, classic),
+                text_coverage(native.g, v.i_color.g, lightness, true, classic),
+                text_coverage(native.b, v.i_color.b, lightness, true, classic)) * opacity;
             Pixel o;
             o.color = float4(v.i_color.rgb * coverage, dot(coverage, float3(1.0, 1.0, 1.0)) / 3.0);
             o.coverage = float4(coverage, o.color.a);
@@ -366,7 +375,7 @@ Pixel glyph_pixel(Varyings v, float clip_cover) {
         }
         if (native.a > 0.0) {
             float intensity = 0.25 * v.i_color.r + 0.5 * v.i_color.g + 0.25 * v.i_color.b;
-            float a = text_coverage(gray, intensity, lightness, false) * opacity;
+            float a = text_coverage(gray, intensity, lightness, false, classic) * opacity;
             return scalar_pixel(float4(v.i_color.rgb * a, a));
         }
     }
@@ -433,6 +442,13 @@ float4 shade(Varyings v) {
 
 Pixel quad_ps(Varyings v) {
     float clip_cover = clip_coverage(v);
+    if (v.i_misc.z == 10.0 || v.i_misc.z == 11.0) {
+        float fade = 1.0;
+        if (v.i_border_color.z > 0.0) fade = min(fade, clamp((v.v_world.y - v.i_border_color.x) / v.i_border_color.z, 0.0, 1.0));
+        if (v.i_border_color.w > 0.0) fade = min(fade, clamp((v.i_border_color.y - v.v_world.y) / v.i_border_color.w, 0.0, 1.0));
+        return scalar_pixel(frame_tex.Load(int3(int2(v.pos.xy), 0)) * (v.i_color.a * fade * clip_cover));
+    }
+    if (v.i_misc.z == 9.0) return scalar_pixel(float4(0.0, 0.0, 0.0, 0.0));
     if (v.i_misc.z == 1.0) return glyph_pixel(v, clip_cover);
     return scalar_pixel(shade(v) * clip_cover);
 }
@@ -503,12 +519,19 @@ Pixel glass_ps(Varyings v) {
     float rr = min(v.i_misc.x * s, min(h.x, h.y));
     float t = max(-rounded_box(q, h, rr), 0.0);
     float bezel = v.i_uv.x * s;
-    float rim_width = v.i_uv.w * s;
+    bool sidebar = v.i_uv.x < 0.0;
+    float rim_width = sidebar ? 0.0 : v.i_uv.w * s;
     float2 n = float2(0.0, 0.0);
     if (t < bezel || t < 3.0 * rim_width) n = glass_normal(q, h, rr);
     float2 at = p;
     if (t < bezel) at -= n * (v.i_uv.y * s * glass_lens(t, bezel));
-    float3 c = glass_tone(glass_sample(at), v.i_border_color);
+    float3 back_color = glass_sample(at);
+    if (sidebar && v.i_uv.w > 0.0) {
+        float right = (v.i_rect.x + v.i_rect.z) * s;
+        float u = clamp((p.x - v.i_rect.x * s) / (2.0 * h.x), 0.0, 1.0);
+        back_color = lerp(back_color, glass_sample(float2(2.0 * right - p.x, p.y)), v.i_uv.w * u * u);
+    }
+    float3 c = glass_tone(back_color, v.i_border_color);
     c += (v.i_color.rgb - c) * v.i_color.a;
     if (t < 3.0 * rim_width) {
         float r = t / rim_width;
@@ -551,9 +574,15 @@ float4 blur_ps(float4 pos : SV_Position) : SV_Target {
     int2 sz = int2(size);
     float3 sum = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
+    float sigma_at = sigma;
+    if (progressive.z > 0.0) {
+        float y = float(gid.y) + 0.5;
+        float t = clamp(min(y - progressive.x, progressive.y - y) / progressive.z, 0.0, 1.0);
+        sigma_at *= 1.0 - 0.65 * t * t * (3.0 - 2.0 * t);
+    }
     for (int k = -radius; k <= radius; k++) {
         int2 p = clamp(gid + dir * k, int2(0, 0), sz - 1);
-        float w = exp(-float(k * k) / (2.0 * sigma * sigma));
+        float w = exp(-float(k * k) / (2.0 * sigma_at * sigma_at));
         sum += source.Load(int3(p, 0)).rgb * w;
         wsum += w;
     }

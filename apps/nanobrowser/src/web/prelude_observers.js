@@ -176,9 +176,10 @@ class MessagePort extends EventTarget {
     }
     const to = this._peer;
     if (!to) return;
-    const m = { data: g.structuredClone(data), ports: $.transferred(transfer) };
+    const isPrim = data === null || (typeof data !== "object" && typeof data !== "function");
+    const m = isPrim && transfer === undefined ? { data, ports: [] } : { data: g.structuredClone(data), ports: $.transferred(transfer) };
     // Held at the port from now, not from the next task: it may be sent on before then.
-    if (to._started) g.setTimeout(() => to._arrive(m), 0);
+    if (to._started) $.postTask(() => to._arrive(m));
     else to._queue.push(m);
   }
   _arrive(m) { if (this._started) this._deliver(m); else this._queue.push(m); }
@@ -424,6 +425,9 @@ class Selection {
   toString() { return ""; }
 }
 def(g, "Selection", Selection);
+for (const c of [MutationObserver, MutationRecord, ResizeObserver, ResizeObserverEntry, IntersectionObserver, IntersectionObserverEntry]) {
+  Object.defineProperty(c.prototype, Symbol.toStringTag, { value: c.name, configurable: true });
+}
 const selection = new Selection();
-g.getSelection = function getSelection() { return selection; };
+def(g, "getSelection", function getSelection() { return selection; });
 })

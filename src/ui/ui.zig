@@ -203,6 +203,7 @@ pub const FontFaceOptions = @import("font_registry.zig").FaceOptions;
 pub const fillFontFace = @import("font_registry.zig").fillFace;
 /// Takes away the families `registerFontFace` added whose names start so.
 pub const unregisterFontFamilies = @import("font_registry.zig").unregisterFamilies;
+pub const unscopedFontGeneration = @import("font_registry.zig").unscopedGeneration;
 /// How far a face's description is from a style, as CSS's font matching ranks them.
 pub const fontFaceScore = @import("font_registry.zig").score;
 /// Text shaped by nanoui's own TrueType reader, not the system's.
@@ -286,6 +287,10 @@ pub const raster = @import("raster.zig");
 pub const View = struct {
     ptr: *anyopaque,
     build: *const fn (ptr: *anyopaque, c: *Context) void,
+    /// Called once after a completed CPU frame, including retained scroll
+    /// frames. Does not imply GPU completion or presentation; must not
+    /// mutate the UI tree.
+    after_frame: ?*const fn (ptr: *anyopaque, c: *Context) void = null,
 
     /// `View.init(&state, State.view)` where `fn view(s: *State, c: *ui.Context) void`.
     pub fn init(ptr: anytype, comptime build_fn: fn (@TypeOf(ptr), *Context) void) View {
@@ -318,6 +323,8 @@ test {
     _ = @import("tests_field_layout.zig");
     _ = frame_log;
     _ = @import("present_slots.zig");
+    // The disk format and temporary-directory cache tests need no D3D device.
+    _ = @import("d3d11_shader_cache.zig");
     _ = @import("tests_effects.zig");
     _ = @import("tests_scroll_x.zig");
     _ = @import("tests_a11y_adjust.zig");
@@ -382,6 +389,9 @@ test {
     _ = @import("tests_raster.zig");
     _ = @import("glass.zig");
     _ = @import("tests_glass.zig");
+    _ = @import("scroll_fade.zig");
+    _ = @import("tests_scroll_fade.zig");
+    _ = @import("tests_scroll_polish.zig");
     _ = @import("tests_overlay_bar.zig");
     _ = @import("tests_border.zig");
     _ = @import("tests_scrollbar.zig");
@@ -398,6 +408,7 @@ test {
     _ = @import("gif_decode.zig");
     _ = @import("images.zig");
     _ = @import("tests_images.zig");
+    if (!@import("text.zig").portable) _ = @import("tests_image_orientation.zig");
     _ = @import("pacing.zig");
     _ = @import("svg.zig");
     _ = @import("tests_svg.zig");
@@ -415,10 +426,13 @@ test {
     _ = keys;
     _ = @import("tests_textedit.zig");
     _ = @import("tests_field.zig");
+    _ = @import("text_selection.zig");
+    _ = @import("tests_text_selection.zig");
     _ = @import("tests_input.zig");
     _ = @import("tests_key_up.zig");
     _ = @import("tests_backtab.zig");
     _ = @import("retain.zig");
+    _ = @import("tests_after_frame.zig");
     if (@import("builtin").os.tag == .macos) {
         _ = @import("tests_menu.zig");
         _ = @import("tests_a11y.zig");

@@ -33,9 +33,11 @@ pub const Result = struct {
     backdrop: bool = false,
 };
 
+const default_style: Style = .{};
+
 /// A shadow root's stand-in: nothing matches it, and it adds no box.
 pub fn shadowRoot(parent: *const Style, parent_scope: ?*const vars.Scope, out: *Style) Result {
-    out.* = wide.inherit(parent);
+    wide.inheritInto(out, parent);
     out.display = .contents;
     return .{ .scope = parent_scope };
 }
@@ -88,18 +90,22 @@ pub fn frameStyle(e: *Engine, n: *dom.Node, parent: *const Style, scope: ?*const
 /// Computes `n`'s style into `out`.
 pub fn element(e: *Engine, n: *dom.Node, parent: *const Style, parent_scope: ?*const vars.Scope, out: *Style) Allocator.Error!Result {
     const gpa = e.gpa;
-    e.matched.clearRetainingCapacity();
     e.pseudo_before.clearRetainingCapacity();
     e.pseudo_after.clearRetainingCapacity();
     e.pseudo_placeholder.clearRetainingCapacity();
     e.pseudo_marker.clearRetainingCapacity();
     e.pseudo_backdrop.clearRetainingCapacity();
     e.collected.clearRetainingCapacity();
+    e.match_ctx.ancestor_bloom = if (n.doc.quirks) std.math.maxInt(u64) else n.ancestor_bloom;
     try e.collectFor(n);
+    var w: usize = 0;
     for (e.collected.items) |m| {
         if (m.container) |c| if (!e.containerHolds(c, n)) continue;
         switch (m.sel.pseudo) {
-            .none, .slotted, .part => try e.matched.append(gpa, m),
+            .none, .slotted, .part => {
+                e.collected.items[w] = m;
+                w += 1;
+            },
             .before => try e.pseudo_before.append(gpa, m),
             .after => try e.pseudo_after.append(gpa, m),
             .placeholder => try e.pseudo_placeholder.append(gpa, m),
@@ -108,14 +114,19 @@ pub fn element(e: *Engine, n: *dom.Node, parent: *const Style, parent_scope: ?*c
             .other => {},
         }
     }
-    std.mem.sort(Entry, e.matched.items, {}, entryLess);
+    const matched = e.collected.items[0..w];
+    if (matched.len == 2) {
+        if (entryLess({}, matched[1], matched[0])) std.mem.swap(Entry, &matched[0], &matched[1]);
+    } else if (matched.len > 2) {
+        std.mem.sort(Entry, matched, {}, entryLess);
+    }
     const inline_d = if (n.attrs.items.len > 0) try inlineDecls(n) else null;
 
-    const scope = try customProperties(e, e.matched.items, inline_d, parent_scope);
+    const scope = try customProperties(e, matched, inline_d, parent_scope);
     var run: Run = .{
         .e = e,
         .node = n,
-        .matched = e.matched.items,
+        .matched = matched,
         .inline_d = inline_d,
         .parent = parent,
         .scope = scope,
@@ -144,7 +155,7 @@ fn hasContent(list: []const Entry) bool {
 }
 
 /// Computes a pseudo-element's style; null if it comes to nothing to show.
-pub fn pseudo(e: *Engine, n: *dom.Node, list: []Entry, parent: *const Style, parent_scope: ?*const vars.Scope, out: *Style) Allocator.Error!bool {
+pub fn pseudo(e: *Engine, n: *dom.Node, list: []Entry, parent: *const Style, parent_scope: ?*const vars.Scope, out: *Style, used_attr: ?*bool) Allocator.Error!bool {
     std.mem.sort(Entry, list, {}, entryLess);
     const scope = try customProperties(e, list, null, parent_scope);
     var run: Run = .{
@@ -157,6 +168,7 @@ pub fn pseudo(e: *Engine, n: *dom.Node, list: []Entry, parent: *const Style, par
         .is_element = false,
     };
     const shows = try run.compute(out);
+    if (used_attr) |ua| ua.* = ua.* or run.ctx.used_attr;
     // `::marker` is there whatever its rules say; `content` only changes its words.
     const always = list.len > 0 and (list[0].sel.pseudo == .marker or list[0].sel.pseudo == .backdrop);
     return (shows or always) and out.display != .none;
@@ -205,22 +217,18 @@ const Run = struct {
     scope: ?*const vars.Scope,
     is_element: bool,
     ua_only: bool = false,
+    phase2_borders: bool = false,
+    has_ua_style: bool = false,
     ctx: values.Ctx = undefined,
-    /// Initial values, with the current color and medium borders in place once
-    /// the color is known.
-    initial: Style = .{},
-    base: Style = .{},
-    ua_style: ?Style = null,
 
     fn compute(r: *Run, out: *Style) Allocator.Error!bool {
         const e = r.e;
-        r.base = wide.inherit(r.parent);
-        if (r.parent == &e.root_parent) r.base.dark_scheme = e.meta_dark;
-        out.* = r.base;
+        wide.inheritInto(out, r.parent);
+        if (r.parent == &e.root_parent) out.dark_scheme = e.meta_dark;
         r.ctx = .{
             .style = out,
             .parent = r.parent,
-            .base = &r.base,
+            .base = r.parent,
             .root_font = e.root_font,
             .vw = e.viewport.width,
             .vh = e.viewport.height,
@@ -240,15 +248,37 @@ const Run = struct {
 
         // Borders and outlines start at `medium` and the current color;
         // `finish` zeroes the ones with no style.
-        for ([_]*Style{ out, &r.base, &r.initial }) |s| {
-            for ([_]*style.Border{ &s.border_top, &s.border_right, &s.border_bottom, &s.border_left, &s.outline }) |b| {
-                b.* = .{ .width = 3, .style = .none, .color = out.color };
-            }
+        r.phase2_borders = true;
+        for ([_]*style.Border{ &out.border_top, &out.border_right, &out.border_bottom, &out.border_left, &out.outline }) |b| {
+            b.* = .{ .width = 3, .style = .none, .color = out.color };
         }
 
         try r.pass(2);
         r.finish(out);
         return r.ctx.has_content;
+    }
+
+    fn initialStyle(r: *Run) *const Style {
+        if (!r.phase2_borders) return &default_style;
+        const s = &r.e.scratch_initial;
+        const col = r.ctx.style.color;
+        for ([_]*style.Border{ &s.border_top, &s.border_right, &s.border_bottom, &s.border_left, &s.outline }) |b| {
+            b.* = .{ .width = 3, .style = .none, .color = col };
+        }
+        return s;
+    }
+
+    fn baseStyle(r: *Run) *const Style {
+        const s = &r.e.scratch_base;
+        wide.inheritInto(s, r.parent);
+        if (r.parent == &r.e.root_parent) s.dark_scheme = r.e.meta_dark;
+        if (r.phase2_borders) {
+            const col = r.ctx.style.color;
+            for ([_]*style.Border{ &s.border_top, &s.border_right, &s.border_bottom, &s.border_left, &s.outline }) |b| {
+                b.* = .{ .width = 3, .style = .none, .color = col };
+            }
+        }
+        return s;
     }
 
     /// Everything of one phase: the UA's rules, presentational hints, author
@@ -270,22 +300,23 @@ const Run = struct {
         for (m[ua_end..]) |x| try r.applyList(x.decls, ph, false);
         if (r.inline_d) |d| try r.applyList(d, ph, false);
         // `!important`: author rules with the layer order turned over.
+        const bit = @as(u8, 1) << ph;
         var any = false;
-        for (m) |x| if (x.decls.has_important) {
+        for (m) |x| if ((x.decls.important_phase_mask & bit) != 0) {
             any = true;
             break;
         };
-        if (r.inline_d) |d| if (d.has_important) {
+        if (r.inline_d) |d| if ((d.important_phase_mask & bit) != 0) {
             any = true;
         };
         if (!any) return;
         var layer_order: std.ArrayList(Entry) = .empty;
         defer layer_order.deinit(r.e.gpa);
-        for (m[ua_end..]) |x| if (x.decls.has_important) try layer_order.append(r.e.gpa, x);
+        for (m[ua_end..]) |x| if ((x.decls.important_phase_mask & bit) != 0) try layer_order.append(r.e.gpa, x);
         std.mem.sort(Entry, layer_order.items, {}, importantLess);
         for (layer_order.items) |x| try r.applyList(x.decls, ph, true);
         if (r.inline_d) |d| try r.applyList(d, ph, true);
-        for (m[0..ua_end]) |x| if (x.decls.has_important) try r.applyList(x.decls, ph, true);
+        for (m[0..ua_end]) |x| if ((x.decls.important_phase_mask & bit) != 0) try r.applyList(x.decls, ph, true);
     }
 
     fn importantLess(_: void, a: Entry, b: Entry) bool {
@@ -294,7 +325,8 @@ const Run = struct {
     }
 
     fn applyList(r: *Run, d: *const Declarations, ph: u2, important: bool) Allocator.Error!void {
-        if (important and !d.has_important) return;
+        const mask = if (important) d.important_phase_mask else d.phase_mask;
+        if ((mask & (@as(u8, 1) << ph)) == 0) return;
         for (d.items) |*x| {
             if (x.important != important) continue;
             if (x.prop == .custom) continue;
@@ -323,8 +355,8 @@ const Run = struct {
         switch (w) {
             .none => {},
             .inherit => wide.copy(d.prop, s, r.parent),
-            .initial => wide.copy(d.prop, s, &r.initial),
-            .unset => wide.copy(d.prop, s, if (prop.isInherited(d.prop)) r.parent else &r.initial),
+            .initial => wide.copy(d.prop, s, r.initialStyle()),
+            .unset => wide.copy(d.prop, s, if (prop.isInherited(d.prop)) r.parent else r.initialStyle()),
             .revert => wide.copy(d.prop, s, try r.reverted()),
         }
     }
@@ -334,8 +366,8 @@ const Run = struct {
         switch (w) {
             .none => {},
             .inherit => wide.copyAll(s, r.parent, ph),
-            .initial => wide.copyAll(s, &r.initial, ph),
-            .unset => wide.copyAll(s, &r.base, ph),
+            .initial => wide.copyAll(s, r.initialStyle(), ph),
+            .unset => wide.copyAll(s, r.baseStyle(), ph),
             .revert => wide.copyAll(s, try r.reverted(), ph),
         }
     }
@@ -343,8 +375,8 @@ const Run = struct {
     /// The style the UA sheet alone gives; at the UA's own level, `revert`
     /// is `unset`.
     fn reverted(r: *Run) Allocator.Error!*const Style {
-        if (r.ua_only) return &r.base;
-        if (r.ua_style == null) {
+        if (r.ua_only) return r.baseStyle();
+        if (!r.has_ua_style) {
             var sub: Run = .{
                 .e = r.e,
                 .node = r.node,
@@ -355,11 +387,10 @@ const Run = struct {
                 .is_element = r.is_element,
                 .ua_only = true,
             };
-            var out: Style = undefined;
-            _ = try sub.compute(&out);
-            r.ua_style = out;
+            _ = try sub.compute(&r.e.scratch_ua);
+            r.has_ua_style = true;
         }
-        return &r.ua_style.?;
+        return &r.e.scratch_ua;
     }
 
     /// Computed-value fix-ups once everything has been applied.

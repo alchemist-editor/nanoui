@@ -4,3 +4,11 @@ import NanoUI.RetainedScroll
 import NanoUI.MarkdownSpec
 import NanoUI.BuildSplit
 import NanoUI.BrowserPerf
+import NanoUI.JitPerf
+import NanoUI.Speedometer3Perf
+import NanoUI.Speedometer3Climb
+import NanoUI.Speedometer3Apex
+import NanoUI.Speedometer3Model
+import NanoUI.IosTouchScroll
+import NanoUI.NanomonRankings
+import NanoUI.NanomonTemperatures

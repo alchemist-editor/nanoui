@@ -32,8 +32,15 @@ fn collOf(o: *js.Object) *Coll {
     return @ptrCast(@alignCast(o.host));
 }
 
+inline fn collGen(c: *const Coll) u32 {
+    return switch (c.kind) {
+        .child_nodes, .children => c.root.children_gen,
+        else => c.root.doc.generation,
+    };
+}
+
 fn fill(w: *World, c: *Coll) Error!void {
-    const gen = c.root.doc.generation;
+    const gen = collGen(c);
     if (c.filled and c.generation == gen and c.kind != .static) return;
     if (c.kind == .static) return;
     c.filled = true;
@@ -58,9 +65,22 @@ fn fill(w: *World, c: *Coll) Error!void {
             }
         },
         .by_class => {
+            var req_bits: u64 = 0;
+            var any = false;
+            var it = std.mem.tokenizeAny(u8, c.name, " \t\r\n\x0c");
+            while (it.next()) |tok| {
+                any = true;
+                req_bits |= @import("../perf_rules.zig").classBit(tok);
+            }
+            if (!any or (c.root.subtree_class_bloom & req_bits) != req_bits) return;
             var at = c.root.first_child;
-            while (at) |x| : (at = x.nextInTree(c.root)) {
+            while (at) |x| {
+                if ((x.subtree_class_bloom & req_bits) != req_bits) {
+                    at = x.nextSkippingChildren(c.root);
+                    continue;
+                }
                 if (x.kind == .element and hasAllClasses(x, c.name)) try c.items.append(a, x);
+                at = x.nextInTree(c.root);
             }
         },
         .static => {},
@@ -79,14 +99,20 @@ fn hasAllClasses(n: *const Node, names: []const u8) bool {
 
 fn collGetIndex(vm: *Vm, o: *js.Object, i: u32) Error!?Value {
     const c = collOf(o);
-    try fill(bind.world(vm), c);
+    if (!c.filled or (c.kind != .static and c.generation != collGen(c))) {
+        try fill(bind.world(vm), c);
+    }
     if (i >= c.items.items.len) return null;
-    return try bind.wrap(vm, c.items.items[i]);
+    const n = c.items.items[i];
+    if (n.js_object) |obj| return Value.fromObject(@ptrCast(@alignCast(obj)));
+    return try bind.wrap(vm, n);
 }
 
 fn collLength(vm: *Vm, o: *js.Object) Error!u32 {
     const c = collOf(o);
-    try fill(bind.world(vm), c);
+    if (!c.filled or (c.kind != .static and c.generation != collGen(c))) {
+        try fill(bind.world(vm), c);
+    }
     return @intCast(c.items.items.len);
 }
 
@@ -195,13 +221,25 @@ fn tokensLength(_: *Vm, o: *js.Object) Error!u32 {
 const token_hooks = js.HostHooks{ .get_index = tokensIndex, .length_index = tokensLength };
 
 pub fn tokenList(w: *World, n: *Node, attr: []const u8, kind: world_mod.Cached) Error!Value {
+    if (kind == .class_list) if (n.js_class_list) |p| {
+        const o: *js.Object = @ptrCast(@alignCast(p));
+        return o.value();
+    };
     const key = world_mod.CacheKey{ .node = n, .kind = kind };
-    if (w.cached.get(key)) |o| return o.value();
+    if (w.cached.get(key)) |o| {
+        if (kind == .class_list) n.js_class_list = o;
+        return o.value();
+    }
     const t = try w.page.arena().create(Tokens);
     t.* = .{ .node = n, .attr = attr };
     const o = try w.vm.newExoticObject(w.extra.token_list, tag_tokens, t, &token_hooks);
     try w.cached.put(w.gpa, key, o);
+    if (kind == .class_list) n.js_class_list = o;
     return o.value();
+}
+
+fn isClassAttr(attr: []const u8) bool {
+    return attr.len == 5 and attr[0] == 'c' and std.mem.eql(u8, attr, "class");
 }
 
 fn hasToken(list: []const u8, token: []const u8) bool {
@@ -217,7 +255,9 @@ fn checkToken(vm: *Vm, token: []const u8) Error!void {
 
 fn tokensContains(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const t = try tokensOf(vm, this);
-    return Value.fromBool(hasToken(t.node.attr(t.attr) orelse "", try bind.str(vm, args, 0)));
+    const tok = try bind.str(vm, args, 0);
+    if (isClassAttr(t.attr)) return Value.fromBool(t.node.hasClass(tok));
+    return Value.fromBool(hasToken(t.node.attr(t.attr) orelse "", tok));
 }
 
 fn writeTokens(w: *World, t: *Tokens, list: []const u8, add: []const []const u8, drop: []const []const u8) Error!void {
@@ -252,6 +292,19 @@ fn argTexts(vm: *Vm, args: []const Value, out: *[64][]const u8) Error![]const []
 
 fn tokensAdd(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const t = try tokensOf(vm, this);
+    if (args.len == 1) {
+        const tok = try vm.toStringSlice(args[0]);
+        try checkToken(vm, tok);
+        const is_cls = isClassAttr(t.attr);
+        const cur = (if (is_cls) t.node.class_attr else t.node.attr(t.attr)) orelse "";
+        if (cur.len == 0) {
+            try mutate.setAttr(bind.world(vm), t.node, t.attr, tok);
+            return Value.undefined;
+        }
+        if (if (is_cls) t.node.hasClass(tok) else hasToken(cur, tok)) return Value.undefined;
+        try writeTokens(bind.world(vm), t, cur, &.{tok}, &.{});
+        return Value.undefined;
+    }
     var buf: [64][]const u8 = undefined;
     const list = try argTexts(vm, args, &buf);
     const cur = t.node.attr(t.attr) orelse "";
@@ -265,6 +318,21 @@ fn tokensAdd(vm: *Vm, this: Value, args: []const Value) Error!Value {
 
 fn tokensRemove(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const t = try tokensOf(vm, this);
+    if (args.len == 1) {
+        const tok = try vm.toStringSlice(args[0]);
+        try checkToken(vm, tok);
+        const is_cls = isClassAttr(t.attr);
+        const cur = (if (is_cls) t.node.class_attr else t.node.attr(t.attr)) orelse return Value.undefined;
+        if (is_cls) {
+            if (!t.node.hasClass(tok)) return Value.undefined;
+            if (t.node.class_single and std.mem.eql(u8, cur, tok)) {
+                try mutate.setAttr(bind.world(vm), t.node, t.attr, "");
+                return Value.undefined;
+            }
+        } else if (!hasToken(cur, tok)) return Value.undefined;
+        try writeTokens(bind.world(vm), t, cur, &.{}, &.{tok});
+        return Value.undefined;
+    }
     var buf: [64][]const u8 = undefined;
     const list = try argTexts(vm, args, &buf);
     const cur = t.node.attr(t.attr) orelse return Value.undefined;
@@ -281,11 +349,16 @@ fn tokensToggle(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const w = bind.world(vm);
     const token = try bind.str(vm, args, 0);
     try checkToken(vm, token);
-    const cur = t.node.attr(t.attr) orelse "";
-    const has = hasToken(cur, token);
+    const is_cls = isClassAttr(t.attr);
+    const cur = (if (is_cls) t.node.class_attr else t.node.attr(t.attr)) orelse "";
+    const has = if (is_cls) t.node.hasClass(token) else hasToken(cur, token);
     const want = if (args.len > 1 and !args[1].isUndefined()) vm.toBoolean(args[1]) else !has;
     if (want == has) return Value.fromBool(has);
-    if (want) try writeTokens(w, t, cur, &.{token}, &.{}) else try writeTokens(w, t, cur, &.{}, &.{token});
+    if (want) {
+        if (cur.len == 0) try mutate.setAttr(w, t.node, t.attr, token) else try writeTokens(w, t, cur, &.{token}, &.{});
+    } else {
+        if (is_cls and t.node.class_single and std.mem.eql(u8, cur, token)) try mutate.setAttr(w, t.node, t.attr, "") else try writeTokens(w, t, cur, &.{}, &.{token});
+    }
     return Value.fromBool(want);
 }
 

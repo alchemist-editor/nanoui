@@ -15,6 +15,8 @@ const world_mod = @import("world.zig");
 const page_input = @import("../page_input.zig");
 const loader = @import("../loader.zig");
 const typed = @import("../js/b_typed.zig");
+const js_conv = @import("../js/conv.zig");
+const js_props = @import("../js/props.zig");
 const http = nanoui.http;
 const Value = js.Value;
 const Vm = js.Vm;
@@ -51,14 +53,14 @@ fn log(vm: *Vm, _: Value, args: []const Value) Error!Value {
 /// The handler text of `on<type>` on a node, or null.
 fn inlineAttr(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const n = bind.asNode(bind.arg(args, 0)) orelse return Value.null;
-    if (n.kind != .element) return Value.null;
+    if (!n.has_on_attr) return Value.null;
     const t = try bind.str(vm, args, 1);
-    var buf: [64]u8 = undefined;
-    if (t.len + 2 > buf.len) return Value.null;
-    buf[0] = 'o';
-    buf[1] = 'n';
-    @memcpy(buf[2..][0..t.len], t);
-    return bind.optStr(vm, n.attr(buf[0 .. t.len + 2]));
+    for (n.attrs.items) |a| {
+        if (a.name.len == t.len + 2 and a.name[0] == 'o' and a.name[1] == 'n' and std.mem.eql(u8, a.name[2..], t)) {
+            return vm.newString(a.value);
+        }
+    }
+    return Value.null;
 }
 
 /// The next object on an event's way up from a node.
@@ -66,6 +68,129 @@ fn eventParent(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const n = bind.asNode(bind.arg(args, 0)) orelse return Value.null;
     if (n.kind == .document) return if (n.doc == bind.world(vm).page.doc) vm.global().value() else Value.null;
     return bind.wrap(vm, n.parent);
+}
+
+fn defHidden(vm: *Vm, _: Value, args: []const Value) Error!Value {
+    const o = bind.arg(args, 0);
+    if (!o.isObject()) return o;
+    const key = try js_conv.toPropKey(vm, bind.arg(args, 1));
+    try js_props.defineData(vm, o.asObject(), key, bind.arg(args, 2), .{ .writable = true, .enumerable = false, .configurable = true });
+    return o;
+}
+
+fn markTarget(_: *Vm, _: Value, args: []const Value) Error!Value {
+    if (bind.asNode(bind.arg(args, 0))) |n| n.has_js_listeners = true;
+    return Value.undefined;
+}
+
+fn pushPath(vm: *Vm, _: Value, args: []const Value) Error!Value {
+    const target = bind.arg(args, 0);
+    const w = bind.world(vm);
+    if (w.dispatch_depth >= w.dispatch_paths.len) return eventPath(vm, Value.undefined, args);
+    const n0 = bind.asNode(target) orelse {
+        w.dispatch_paths[w.dispatch_depth] = .{ .len = 255 };
+        w.dispatch_depth += 1;
+        return (try vm.newArray(&.{target})).value();
+    };
+    const is_load = if (args.len > 1 and args[1].isString()) std.mem.eql(u8, try vm.toStringSlice(args[1]), "load") else false;
+    var count: usize = 0;
+    var probe: ?*dom.Node = n0;
+    while (probe) |pn| {
+        count += 1;
+        if (count > 128) {
+            w.dispatch_paths[w.dispatch_depth] = .{ .len = 255 };
+            w.dispatch_depth += 1;
+            return eventPath(vm, Value.undefined, args);
+        }
+        probe = if (pn.kind == .document) null else pn.parent;
+    }
+    const slot = w.dispatch_depth;
+    w.dispatch_depth += 1;
+    var dp = &w.dispatch_paths[slot];
+    dp.len = 0;
+    dp.has_win = false;
+    var active: [129]Value = undefined;
+    active[0] = target;
+    var alen: usize = 1;
+    var cur: ?*dom.Node = n0;
+    while (cur) |n| {
+        dp.nodes[dp.len] = n;
+        dp.len += 1;
+        if (n != n0 and (n.has_js_listeners or n.has_on_attr)) {
+            active[alen] = try bind.wrap(vm, n);
+            alen += 1;
+        }
+        if (n.kind == .document) {
+            if (!is_load and n.doc == w.page.doc) {
+                dp.has_win = true;
+                active[alen] = vm.global().value();
+                alen += 1;
+            }
+            break;
+        }
+        cur = n.parent;
+    }
+    return (try vm.newArray(active[0..alen])).value();
+}
+
+fn popPath(vm: *Vm, _: Value, _: []const Value) Error!Value {
+    const w = bind.world(vm);
+    if (w.dispatch_depth > 0) w.dispatch_depth -= 1;
+    return Value.undefined;
+}
+
+fn materializePath(vm: *Vm, _: Value, args: []const Value) Error!Value {
+    const w = bind.world(vm);
+    const slot_i = if (args.len > 0 and args[0].isInt()) args[0].asInt() else -1;
+    if (slot_i < 0 or slot_i >= w.dispatch_depth) return Value.null;
+    const dp = &w.dispatch_paths[@intCast(slot_i)];
+    if (dp.len == 255) return Value.null;
+    var buf: [129]Value = undefined;
+    var out_len: usize = 0;
+    for (dp.nodes[0..dp.len]) |n| {
+        buf[out_len] = try bind.wrap(vm, n);
+        out_len += 1;
+    }
+    if (dp.has_win) {
+        buf[out_len] = vm.global().value();
+        out_len += 1;
+    }
+    return (try vm.newArray(buf[0..out_len])).value();
+}
+
+fn eventPath(vm: *Vm, _: Value, args: []const Value) Error!Value {
+    const target = bind.arg(args, 0);
+    const n0 = bind.asNode(target) orelse return (try vm.newArray(&.{target})).value();
+    const is_load = if (args.len > 1 and args[1].isString()) std.mem.eql(u8, try vm.toStringSlice(args[1]), "load") else false;
+    var buf: [64]Value = undefined;
+    buf[0] = target;
+    var len: usize = 1;
+    var cur: ?*dom.Node = n0;
+    const w = bind.world(vm);
+    while (cur) |n| {
+        const next_val: Value = if (n.kind == .document)
+            (if (!is_load and n.doc == w.page.doc) vm.global().value() else Value.null)
+        else
+            try bind.wrap(vm, n.parent);
+        if (next_val.isNull()) break;
+        if (len < buf.len) {
+            buf[len] = next_val;
+            len += 1;
+            cur = if (n.kind == .document) null else n.parent;
+        } else break;
+    }
+    const arr = try vm.newArray(buf[0..len]);
+    while (cur) |n| {
+        const next_val: Value = if (n.kind == .document)
+            (if (!is_load and n.doc == w.page.doc) vm.global().value() else Value.null)
+        else
+            try bind.wrap(vm, n.parent);
+        if (next_val.isNull()) break;
+        try arr.setIdx(vm, @intCast(len), next_val);
+        len += 1;
+        cur = if (n.kind == .document) null else n.parent;
+    }
+    return arr.value();
 }
 
 fn isNode(_: *Vm, _: Value, args: []const Value) Error!Value {
@@ -114,7 +239,7 @@ fn historyGo(vm: *Vm, _: Value, args: []const Value) Error!Value {
 
 fn fragment(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const w = bind.world(vm);
-    _ = @import("api_geometry.zig").flushLayout(w);
+    _ = @import("api_geometry.zig").flushDisplayList(w);
     page_input.fragment(w.page, try bind.str(vm, args, 0));
     return Value.undefined;
 }
@@ -265,13 +390,27 @@ fn takeImages(vm: *Vm, _: Value, _: []const Value) Error!Value {
     return arr.value();
 }
 
+fn postTask(vm: *Vm, _: Value, args: []const Value) Error!Value {
+    const w = bind.world(vm);
+    if (w.stopped) return Value.undefined;
+    try w.timers.postTask(w, bind.arg(args, 0));
+    return Value.undefined;
+}
+
 const table = [_]bind.Method{
+    .{ .name = "postTask", .arity = 1, .f = postTask },
     .{ .name = "takeImages", .arity = 0, .f = takeImages },
     .{ .name = "hook", .arity = 2, .f = hook },
     .{ .name = "listen", .arity = 1, .f = listen },
     .{ .name = "log", .arity = 2, .f = log },
+    .{ .name = "defHidden", .arity = 3, .f = defHidden },
+    .{ .name = "markTarget", .arity = 1, .f = markTarget },
+    .{ .name = "pushPath", .arity = 2, .f = pushPath },
+    .{ .name = "popPath", .arity = 0, .f = popPath },
+    .{ .name = "materializePath", .arity = 1, .f = materializePath },
     .{ .name = "inlineAttr", .arity = 2, .f = inlineAttr },
     .{ .name = "eventParent", .arity = 1, .f = eventParent },
+    .{ .name = "eventPath", .arity = 2, .f = eventPath },
     .{ .name = "isNode", .arity = 1, .f = isNode },
     .{ .name = "markAll", .arity = 1, .f = markAll },
     .{ .name = "pageUrl", .arity = 0, .f = pageUrl },

@@ -87,6 +87,10 @@ fn sparsify(vm: *Vm, o: *Object) Error!void {
     };
     o.elems_len = 0;
     o.flags.has_sparse = true;
+    if (o.flags.is_proto) {
+        o.flags.proto_dirty = true;
+        vm.bumpProtoEpoch();
+    }
     if (!o.shape.is_dict) o.shape = try shape_mod.toDict(vm, o.shape, o.shape.proto);
     var i: u32 = 0;
     while (i < n) : (i += 1) {
@@ -168,6 +172,10 @@ pub fn ordinaryDefine(vm: *Vm, o: *Object, key: PropKey, d: Desc) Error!bool {
         try sparsify(vm, o);
     }
     const s = o.shape.find(key).?;
+    if (o.flags.is_proto) {
+        o.flags.proto_dirty = true;
+        vm.bumpProtoEpoch();
+    }
     if (@as(u8, @bitCast(nf)) != @as(u8, @bitCast(cf))) {
         if (!o.shape.is_dict) o.shape = try shape_mod.toDict(vm, o.shape, o.shape.proto);
         shape_mod.dictSetFlags(o.shape, s, nf);
@@ -290,6 +298,7 @@ pub fn setIntegrityFast(vm: *Vm, o: *Object, frozen: bool) Error!void {
     if (o.class == .array and frozen) o.flags.length_readonly = true;
     const count = o.shape.count;
     if (count == 0) return;
+    if (o.flags.is_proto) vm.bumpProtoEpoch();
     if (!o.shape.is_dict) o.shape = try shape_mod.toDict(vm, o.shape, o.shape.proto);
     var s: u32 = 0;
     while (s < count) : (s += 1) {

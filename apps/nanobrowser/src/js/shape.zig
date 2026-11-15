@@ -121,6 +121,9 @@ pub const Shape = struct {
     is_dict: bool,
     /// In the separate tree for exotic objects, whose lookups must never be cached.
     exotic_tree: bool = false,
+    /// True iff `!is_dict and !exotic_tree` and every entry in `0..count` is a
+    /// non-symbol, non-index property with `PropFlags.all` (Theorem 21).
+    all_plain_str: bool = true,
     proto: ?*Object,
     table: *Table,
     /// Entries valid for this shape; in a dictionary, includes tombstones.
@@ -178,6 +181,7 @@ fn newShape(vm: *Vm, proto: ?*Object, table: *Table, count: u32) Error!*Shape {
     const s = try vm.heap.create(Shape, .shape);
     s.is_dict = false;
     s.exotic_tree = false;
+    s.all_plain_str = true;
     s.proto = proto;
     s.table = table;
     s.count = count;
@@ -192,6 +196,7 @@ fn newShape(vm: *Vm, proto: ?*Object, table: *Table, count: u32) Error!*Shape {
 
 /// The empty shape for objects with this prototype.
 pub fn rootFor(vm: *Vm, proto: ?*Object) Error!*Shape {
+    if (proto) |p| p.flags.is_proto = true;
     if (vm.root_shapes.get(proto)) |s| return s;
     const t = try vm.gpa.create(Table);
     t.* = .{};
@@ -203,11 +208,13 @@ pub fn rootFor(vm: *Vm, proto: ?*Object) Error!*Shape {
 /// The empty shape for exotic objects with this prototype. Ordinary objects never share
 /// it, so an inline cache filled from an ordinary object can't answer for an exotic one.
 pub fn exoticRootFor(vm: *Vm, proto: ?*Object) Error!*Shape {
+    if (proto) |p| p.flags.is_proto = true;
     if (vm.exotic_root_shapes.get(proto)) |s| return s;
     const t = try vm.gpa.create(Table);
     t.* = .{};
     const s = try newShape(vm, proto, t, 0);
     s.exotic_tree = true;
+    s.all_plain_str = false;
     try vm.exotic_root_shapes.put(vm.gpa, proto, s);
     return s;
 }
@@ -237,6 +244,7 @@ pub fn transition(vm: *Vm, s: *Shape, key: PropKey, flags: PropFlags) Error!*Sha
     c.parent = s;
     c.key = key;
     c.flags = flags;
+    c.all_plain_str = s.all_plain_str and !key.isSymbol() and !key.isIndex() and fbits == @as(u8, @bitCast(PropFlags.all));
     if (s.single == null and s.many == null) {
         s.single = c;
     } else {
@@ -252,6 +260,7 @@ pub fn transition(vm: *Vm, s: *Shape, key: PropKey, flags: PropFlags) Error!*Sha
 
 /// A private dictionary shape with the same layout as s, for one object to own.
 pub fn toDict(vm: *Vm, s: *Shape, proto: ?*Object) Error!*Shape {
+    if (proto) |p| p.flags.is_proto = true;
     const gpa = vm.gpa;
     const t = try gpa.create(Table);
     t.* = .{};
@@ -259,6 +268,7 @@ pub fn toDict(vm: *Vm, s: *Shape, proto: ?*Object) Error!*Shape {
     if (s.count > Table.linear_max) try t.rebuildIndex(gpa);
     const d = try newShape(vm, proto, t, s.count);
     d.is_dict = true;
+    d.all_plain_str = false;
     d.live = s.live;
     return d;
 }

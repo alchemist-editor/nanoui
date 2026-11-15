@@ -262,7 +262,7 @@ fn inputClick(p: *Page, n: *dom.Node) void {
 }
 
 fn changed(p: *Page, n: *dom.Node) void {
-    p.doc.touchStyle();
+    p.doc.markStyle(n.parent orelse n);
     web.simpleEvent(p, n, "input");
     web.simpleEvent(p, n, "change");
 }
@@ -278,7 +278,10 @@ pub fn uncheckGroup(root: *dom.Node, n: *dom.Node) void {
         if (!x.isTag("input") or x == n) continue;
         if (x.attr("name")) |v| if (std.mem.eql(u8, v, name)) {
             const kind = x.attr("type") orelse "";
-            if (std.ascii.eqlIgnoreCase(kind, "radio")) x.checked = false;
+            if (std.ascii.eqlIgnoreCase(kind, "radio")) {
+                if (isChecked(x)) x.doc.markStyle(x.parent orelse x);
+                x.checked = false;
+            }
         };
     }
 }

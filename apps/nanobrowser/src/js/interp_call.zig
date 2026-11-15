@@ -13,6 +13,7 @@ const Object = objmod.Object;
 const props = @import("props.zig");
 const conv = @import("conv.zig");
 const interp = @import("interp.zig");
+const jit = @import("jit.zig");
 const proxy = @import("b_proxy.zig");
 const coroutine = @import("coroutine.zig");
 const str = @import("string.zig");
@@ -27,7 +28,8 @@ pub fn interrupt(vm: *Vm) Error!void {
     }
 }
 
-fn classCallError(vm: *Vm, callee: *Object) Error {
+noinline fn classCallError(vm: *Vm, callee: *Object) Error {
+    @branchHint(.cold);
     var buf: [120]u8 = undefined;
     const name = callee.payload.fp.name.flat(vm) catch "";
     const m = std.fmt.bufPrint(&buf, "Class constructor {s} cannot be invoked without 'new'", .{name[0..@min(name.len, 64)]}) catch "Class constructor cannot be invoked without 'new'";
@@ -35,25 +37,26 @@ fn classCallError(vm: *Vm, callee: *Object) Error {
 }
 
 /// Pushes a frame for a closure. On return, vm.sp is the new frame's operand stack.
-pub fn pushClosure(vm: *Vm, callee: *Object, args: [*]Value, argc: u32, ret_sp: [*]Value, new_target: Value, this_in: Value, is_construct: bool) Error!*Frame {
+pub inline fn pushClosure(vm: *Vm, callee: *Object, args: [*]Value, argc: u32, ret_sp: [*]Value, new_target: Value, this_in: Value, is_construct: bool) Error!*Frame {
     const fp = callee.payload.fp;
     if (fp.is_class_ctor and !is_construct) return classCallError(vm, callee);
     if (vm.frame_top >= vm_mod.max_frames) return vm.throwError(.RangeError, "Maximum call stack size exceeded");
     const nparams: u32 = fp.nparams;
     var bp = args;
-    if (argc > nparams) bp = args + argc;
-    const locals_end = bp + fp.nlocals;
+    const i: u32 = @min(argc, nparams);
     const limit = @intFromPtr(vm.stack.ptr) + vm.stack.len * @sizeOf(Value);
+    if (argc != 0 and fp.needs_args) {
+        if (@intFromPtr(args + argc) + (@as(usize, fp.nlocals) + fp.max_stack + 64) * @sizeOf(Value) > limit) {
+            return vm.throwError(.RangeError, "Maximum call stack size exceeded");
+        }
+        bp = args + argc;
+        if (i != 0) @memcpy(bp[0..i], args[0..i]);
+    }
+    const locals_end = bp + fp.nlocals;
     if (@intFromPtr(locals_end) + (@as(usize, fp.max_stack) + 64) * @sizeOf(Value) > limit) {
         return vm.throwError(.RangeError, "Maximum call stack size exceeded");
     }
-    var i: u32 = 0;
-    if (argc > nparams) {
-        while (i < nparams) : (i += 1) bp[i] = args[i];
-    } else {
-        i = argc;
-    }
-    while (i < fp.nlocals) : (i += 1) bp[i] = Value.undefined;
+    if (i < fp.nlocals) @memset(bp[i..fp.nlocals], Value.undefined);
     var this = this_in;
     if (fp.coerce_this and !this.isObject()) {
         this = if (this.isNullish()) vm.global_obj.value() else (try conv.toObject(vm, this)).value();
@@ -81,7 +84,7 @@ pub fn pushClosure(vm: *Vm, callee: *Object, args: [*]Value, argc: u32, ret_sp: 
     return f;
 }
 
-fn callNative(vm: *Vm, o: *Object, this: Value, args: []const Value) Error!Value {
+pub inline fn callNative(vm: *Vm, o: *Object, this: Value, args: []const Value) Error!Value {
     const saved_nt = vm.new_target;
     const saved_callee = vm.callee;
     vm.new_target = Value.undefined;
@@ -92,7 +95,8 @@ fn callNative(vm: *Vm, o: *Object, this: Value, args: []const Value) Error!Value
         vm.callee = saved_callee;
         vm.depth -= 1;
     }
-    try vm.checkNativeStack();
+    if ((vm.depth & 7) == 0) try vm.checkNativeStack();
+    @import("../perf_rules.zig").prof_nat_calls += 1;
     return o.payload.native.func(vm, this, args);
 }
 
@@ -142,6 +146,12 @@ pub fn callNonClosure(vm: *Vm, callee: Value, this: Value, args: []const Value) 
         .bound => {
             const b = o.payload.bound;
             if (b.args.len == 0) return call(vm, b.target.value(), b.this, args);
+            var stack_buf: [16]Value = undefined;
+            if (b.args.len + args.len <= stack_buf.len) {
+                @memcpy(stack_buf[0..b.args.len], b.args);
+                @memcpy(stack_buf[b.args.len..][0..args.len], args);
+                return call(vm, b.target.value(), b.this, stack_buf[0 .. b.args.len + args.len]);
+            }
             const all = try vm.gpa.alloc(Value, b.args.len + args.len);
             defer vm.gpa.free(all);
             @memcpy(all[0..b.args.len], b.args);
@@ -178,17 +188,50 @@ pub fn call(vm: *Vm, callee: Value, this: Value, args: []const Value) Error!Valu
     if (o.class != .closure) return callNonClosure(vm, callee, this, args);
     vm.enterFromHost();
     const saved_sp = vm.sp;
+    defer vm.sp = saved_sp;
     vm.depth += 1;
     defer vm.depth -= 1;
     try vm.checkNativeStack();
     try pushEntry(vm, o, this, args, Value.undefined, false);
-    const r = interp.run(vm);
-    vm.sp = saved_sp;
-    return r;
+    return jit.runEntry(vm);
 }
 
 /// The object `new` makes: ordinary, with new_target's prototype.
 pub fn allocThis(vm: *Vm, _: *Object, new_target: Value) Error!*Object {
+    if (new_target.isObject()) {
+        const nt = new_target.asObject();
+        if (nt.class == .closure) {
+            if (nt.extra()) |x| if (x.inst_shape) |is| {
+                if (nt.flags.class_ctor) return objmod.alloc(vm, is, .object);
+                if (nt.shape == x.proto_shape and !nt.shape.is_dict) {
+                    if (is.proto) |ip| if (nt.slots[x.proto_slot].bits == ip.value().bits) {
+                        return objmod.alloc(vm, is, .object);
+                    };
+                }
+            };
+            if (!nt.flags.exotic) {
+                if (nt.flags.lazy_fn) try props.touchLazy(vm, nt, vm.k.prototype);
+                if (!nt.shape.is_dict) if (nt.shape.find(vm.k.prototype)) |slot| {
+                    if (!nt.shape.flagsAt(slot).accessor) {
+                        const pv = nt.slots[slot];
+                        if (pv.isObject()) {
+                            const is = try @import("shape.zig").rootFor(vm, pv.asObject());
+                            const x = nt.extra() orelse blk: {
+                                const nx = try vm.gpa.create(objmod.FnExtra);
+                                nx.* = .{};
+                                nt.host = nx;
+                                break :blk nx;
+                            };
+                            x.inst_shape = is;
+                            x.proto_shape = nt.shape;
+                            x.proto_slot = slot;
+                            return objmod.alloc(vm, is, .object);
+                        }
+                    }
+                };
+            }
+        }
+    }
     const proto = try props.getV(vm, new_target, vm.k.prototype);
     return objmod.create(vm, if (proto.isObject()) proto.asObject() else vm.protos.object, .object);
 }
@@ -216,15 +259,14 @@ pub fn construct(vm: *Vm, callee: Value, args: []const Value, new_target: Value)
         .closure => {
             vm.enterFromHost();
             const saved_sp = vm.sp;
+            defer vm.sp = saved_sp;
             vm.depth += 1;
             defer vm.depth -= 1;
             try vm.checkNativeStack();
             var this = Value.hole;
             if (!o.flags.derived_ctor) this = (try allocThis(vm, o, new_target)).value();
             try pushEntry(vm, o, this, args, new_target, true);
-            const r = interp.run(vm);
-            vm.sp = saved_sp;
-            return r;
+            return jit.runEntry(vm);
         },
         .native => {
             const saved_nt = vm.new_target;

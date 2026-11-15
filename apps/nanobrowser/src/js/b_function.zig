@@ -23,6 +23,15 @@ pub fn listFromArrayLike(vm: *Vm, v: Value) Error![]Value {
     if (v.isNullish()) return vm.gpa.alloc(Value, 0);
     if (!v.isObject()) return vm.throwError(.TypeError, "CreateListFromArrayLike called on non-object");
     const o = v.asObject();
+    if (o.class == .host_exotic) {
+        if (o.payload.hooks.length_index) |li| if (o.payload.hooks.get_index) |gi| {
+            const n = try li(vm, o);
+            const out = try vm.gpa.alloc(Value, n);
+            errdefer vm.gpa.free(out);
+            for (out, 0..) |*slot, i| slot.* = (try gi(vm, o, @intCast(i))) orelse try props.get(vm, o, PropKey.fromIndex(@intCast(i)));
+            return out;
+        };
+    }
     const n = try conv.lengthOf(vm, o);
     if (n > 1 << 24) return vm.throwError(.RangeError, "Too many arguments");
     const out = try vm.gpa.alloc(Value, n);
@@ -31,26 +40,69 @@ pub fn listFromArrayLike(vm: *Vm, v: Value) Error![]Value {
     return out;
 }
 
-fn fnCall(vm: *Vm, this: Value, args: []const Value) Error!Value {
+pub fn fnCall(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const rest = if (args.len > 1) args[1..] else args[0..0];
     return calls.call(vm, this, u.arg(args, 0), rest);
 }
 
-fn fnApply(vm: *Vm, this: Value, args: []const Value) Error!Value {
+pub fn fnApply(vm: *Vm, this: Value, args: []const Value) Error!Value {
     if (!this.isCallable()) return vm.throwError(.TypeError, "Function.prototype.apply was called on a non-function");
-    const list = try listFromArrayLike(vm, u.arg(args, 1));
+    const this_arg = u.arg(args, 0);
+    const arr_val = u.arg(args, 1);
+    if (arr_val.isNullish()) return calls.call(vm, this, this_arg, &.{});
+    if (!arr_val.isObject()) return vm.throwError(.TypeError, "CreateListFromArrayLike called on non-object");
+    const o = arr_val.asObject();
+    var stack_buf: [32]Value = undefined;
+    const is_fast_args = o.class == .arguments and (o.shape == vm.args_strict_shape or o.shape == vm.args_sloppy_shape) and o.slots[0].bits == Value.fromUsize(o.elems_len).bits;
+    if (!o.flags.exotic and !o.flags.has_sparse and ((o.class == .array and o.elems_len == o.arr_len) or is_fast_args) and o.elems_len <= stack_buf.len) {
+        const len = o.elems_len;
+        var has_hole = false;
+        for (o.elems[0..len]) |el| {
+            if (el.isHole()) {
+                has_hole = true;
+                break;
+            }
+        }
+        if (!has_hole) {
+            @memcpy(stack_buf[0..len], o.elems[0..len]);
+            return calls.call(vm, this, this_arg, stack_buf[0..len]);
+        }
+    }
+    const n = try conv.lengthOf(vm, o);
+    if (n <= stack_buf.len) {
+        for (0..n) |i| {
+            if (i < o.elems_len and !o.flags.exotic) {
+                const el = o.elems[i];
+                if (!el.isHole()) {
+                    stack_buf[i] = el;
+                    continue;
+                }
+            }
+            stack_buf[i] = try props.get(vm, o, PropKey.fromIndex(@intCast(i)));
+        }
+        return calls.call(vm, this, this_arg, stack_buf[0..n]);
+    }
+    const list = try listFromArrayLike(vm, arr_val);
     defer vm.gpa.free(list);
-    return calls.call(vm, this, u.arg(args, 0), list);
+    return calls.call(vm, this, this_arg, list);
 }
 
 fn fnBind(vm: *Vm, this: Value, args: []const Value) Error!Value {
     if (!this.isCallable()) return vm.throwError(.TypeError, "Bind must be called on a function");
     const target = this.asObject();
-    const bound_args = try vm.gpa.dupe(Value, if (args.len > 1) args[1..] else args[0..0]);
-    errdefer vm.gpa.free(bound_args);
+    const bound_args: []Value = if (args.len > 1) try vm.gpa.dupe(Value, args[1..]) else &.{};
+    errdefer if (bound_args.len > 0) vm.gpa.free(bound_args);
     const data = try vm.gpa.create(objmod.BoundData);
     errdefer vm.gpa.destroy(data);
     data.* = .{ .target = target, .this = u.arg(args, 0), .args = bound_args };
+    if (target.flags.lazy_fn and target.shape == vm.fn_root) {
+        const o = try objmod.alloc(vm, vm.fn_root, .bound);
+        o.payload = .{ .bound = data };
+        o.flags.callable = true;
+        o.flags.constructor = target.flags.constructor;
+        o.flags.lazy_fn = true;
+        return o.value();
+    }
     const proto = try props.getProto(vm, target);
     const o = try objmod.create(vm, proto, .bound);
     o.payload = .{ .bound = data };

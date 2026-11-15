@@ -184,6 +184,13 @@ averages and blurs what's under it, then shades it on the GPU, and the CPU
 renderer computes the same pixels. It looks the same on Linux and Windows,
 and a test checks the two renderers agree.
 
+`.glass(.{ .style = .sidebar })` adds progressive blur at the top and bottom
+and a subtle reflection of content on its right. Paint the content first,
+extending beneath the sidebar, then overlay the pane and its controls.
+`blur` sets the maximum blur (8 points), `edge_blur` its fade distance
+(64 points; 0 for uniform blur), and `reflection` its strength (0–1,
+default 0.16; 0 disables it). The Gallery's Glass page demonstrates it.
+
 <p align="center">
   <img src="docs/images/gallery-glass.png" alt="A toolbar of Liquid Glass over colored cards, with a tinted button and a pane of clear glass" width="640">
   <br><sub>The gallery's Glass page.</sub>
@@ -244,7 +251,8 @@ moved by `ui.motion`:
 - **Buttons** in its variants (primary, danger, ghost, outline, link, …) and
   sizes, with icons, loading and tooltips.
 - **Display:** tags, badges, avatars and stacks of them, alerts, skeletons,
-  spinners, progress bars and rings.
+  spinners, progress bars and rings, and [timeline rows](docs/kit-timeline.md)
+  with a decorative rail beside ordinary native content.
 - **Overlays:** tooltips, popovers, menus, dialogs, sheets and toasts. They
   open on layers over the page, go where they fit, and close on Escape or a
   click elsewhere.
@@ -537,6 +545,9 @@ A counter app each, from empty build caches, on the same M3 Ultra (`sh tools/bui
 `build.zig` compiles nanoui's non-generic runtime (`src/rt.zig`: renderer, text shaping, layout, paint, platform backend) once into `libnanoui-rt.a`, so an edit in the app only recompiles the tiny app root and relinks in ~0.56 s.
 
 ## Development
+
+Enable local formatting and line-limit checks with `sh tools/install-hooks.sh`.
+The hooks check staged/pushed snapshots without restaging; see [Git hooks](docs/git-hooks.md).
 
 ```sh
 zig build lines                                                       # the 600-line limit, enforced

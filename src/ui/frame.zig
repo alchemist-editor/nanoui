@@ -23,6 +23,7 @@ pub const Result = struct {
 };
 
 pub fn run(c: *Context, view: View, ts: *text.TextSystem, instances: *std.ArrayList(gpu.Instance), size: types.Size, scale: f32, theme: Theme, dt: f32, time: f64) Result {
+    defer if (view.after_frame) |after| after(view.ptr, c);
     if (retain.shift(c, instances, size, scale)) {
         c.stats.retained = true;
         c.stats.build_ms = 0;
@@ -46,7 +47,13 @@ pub fn run(c: *Context, view: View, ts: *text.TextSystem, instances: *std.ArrayL
     @import("scroll.zig").updateScrollbarDrag(c);
 
     const t0 = now();
-    if (c.input.pressed and c.input.button == .left) c.selection.pressed = true;
+    if (c.input.pressed and c.input.button == .left) {
+        c.selection.pressed = true;
+        // A text field sets it again while this frame builds if the press
+        // is its own; left over from an earlier press, it would keep every
+        // later press from selecting or clearing text outside the field.
+        c.selection.blocked = false;
+    }
     c.copy_done = false;
     c.copy_requested = false;
     for (c.input.ops) |op| if (op == .command and op.command == .copy) {
@@ -60,7 +67,7 @@ pub fn run(c: *Context, view: View, ts: *text.TextSystem, instances: *std.ArrayL
         @import("tooltip.zig").flush(c);
         if (c.stack.items.len != 1)
             std.debug.panic("nanoui: {d} box(es) left open: every column, row, card, scroll and pressable needs an end", .{c.stack.items.len - 1});
-        if (!c.changed or passes >= 3) break;
+        if ((!c.changed and !c.input.pendingKeys()) or passes >= 3) break;
         c.rebuild();
     }
 
@@ -107,6 +114,8 @@ pub fn run(c: *Context, view: View, ts: *text.TextSystem, instances: *std.ArrayL
     const hot_before = c.hot;
     c.commitHits();
     c.finish();
+    // A nested burst may outlive the build-pass budget: wake another frame.
+    if (c.input.pendingKeys()) c.animating = true;
     c.stats.retained = false;
     retain.store(c, instances);
     return .{ .hot_changed = c.hot != hot_before };

@@ -27,19 +27,21 @@ fn elementOf(vm: *Vm, this: Value) Error!*Node {
 
 fn tagName(vm: *Vm, this: Value, _: []const Value) Error!Value {
     const n = try elementOf(vm, this);
-    if (n.ns != .html) return vm.newString(n.tag);
+    if (n.ns != .html) return if (n.tag.len <= 32) vm.internString(n.tag) else vm.newString(n.tag);
     var buf: [128]u8 = undefined;
+    if (n.tag.len <= 32) return vm.internString(std.ascii.upperString(&buf, n.tag));
     if (n.tag.len <= buf.len) return vm.newString(std.ascii.upperString(&buf, n.tag));
     return vm.newString(n.tag);
 }
 
 fn localName(vm: *Vm, this: Value, _: []const Value) Error!Value {
-    return vm.newString((try elementOf(vm, this)).tag);
+    const t = (try elementOf(vm, this)).tag;
+    return if (t.len <= 32) vm.internString(t) else vm.newString(t);
 }
 
 fn namespaceURI(vm: *Vm, this: Value, _: []const Value) Error!Value {
     const n = try elementOf(vm, this);
-    return vm.newString(switch (n.ns) {
+    return vm.internString(switch (n.ns) {
         .html => "http://www.w3.org/1999/xhtml",
         .svg => "http://www.w3.org/2000/svg",
         .mathml => "http://www.w3.org/1998/Math/MathML",
@@ -183,11 +185,32 @@ fn parseFor(w: *World, context: *Node, text: []const u8) Error!*Node {
     return f;
 }
 
+fn isNormalInnerHtmlContainer(n: *const Node) bool {
+    if (n.kind != .element or n.ns != .html or bind.isShadow(n)) return false;
+    const t = n.tag;
+    return std.mem.eql(u8, t, "div") or std.mem.eql(u8, t, "span") or std.mem.eql(u8, t, "p") or
+        std.mem.eql(u8, t, "li") or std.mem.eql(u8, t, "a") or std.mem.eql(u8, t, "button") or
+        std.mem.eql(u8, t, "label") or std.mem.eql(u8, t, "td") or std.mem.eql(u8, t, "th") or
+        std.mem.eql(u8, t, "h1") or std.mem.eql(u8, t, "h2") or std.mem.eql(u8, t, "h3") or
+        std.mem.eql(u8, t, "section") or std.mem.eql(u8, t, "article") or std.mem.eql(u8, t, "header") or
+        std.mem.eql(u8, t, "footer") or std.mem.eql(u8, t, "main") or std.mem.eql(u8, t, "nav") or
+        std.mem.eql(u8, t, "ul") or std.mem.eql(u8, t, "ol") or std.mem.eql(u8, t, "strong") or
+        std.mem.eql(u8, t, "em") or std.mem.eql(u8, t, "b") or std.mem.eql(u8, t, "i");
+}
+
 fn setInnerHTML(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const n = try nodeOf(vm, this);
     const w = bind.world(vm);
     const text = try bind.strNullEmpty(vm, args, 0);
     const root = contentRoot(w, n);
+    if (text.len == 0) {
+        try mutate.replaceAllWith(w, root, null);
+        return Value.undefined;
+    }
+    if (isNormalInnerHtmlContainer(root) and std.mem.indexOfAny(u8, text, "<&\r\x00") == null) {
+        try mutate.replaceWithText(w, root, text);
+        return Value.undefined;
+    }
     const context = if (root.kind == .element and !bind.isShadow(root)) root else try n.doc.createElement("div");
     const f = try parseFor(w, context, text);
     try mutate.replaceAllWith(w, root, f);
@@ -273,25 +296,17 @@ fn selectorError(vm: *Vm, e: css.QueryError, selector: []const u8) Error {
     return error.OutOfMemory;
 }
 
-const Scratch = struct {
-    arena: std.heap.ArenaAllocator,
-
-    fn init(w: *World) Scratch {
-        return .{ .arena = std.heap.ArenaAllocator.init(w.gpa) };
-    }
-
-    fn deinit(s: *Scratch) void {
-        s.arena.deinit();
-    }
-};
+inline fn resetQueryArena(w: *World) void {
+    if (w.query_arena.state.used_list != null) _ = w.query_arena.reset(.retain_capacity);
+}
 
 /// Flushes nothing: selectors read attributes and the tree.
 fn querySelector(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const n = try nodeOf(vm, this);
+    const w = bind.world(vm);
     const sel = try bind.str(vm, args, 0);
-    var s = Scratch.init(bind.world(vm));
-    defer s.deinit();
-    const found = css.querySelector(n, sel, s.arena.allocator()) catch |e| return selectorError(vm, e, sel);
+    defer resetQueryArena(w);
+    const found = css.querySelector(n, sel, w.query_arena.allocator()) catch |e| return selectorError(vm, e, sel);
     return bind.wrap(vm, found);
 }
 
@@ -299,27 +314,26 @@ fn querySelectorAll(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const n = try nodeOf(vm, this);
     const w = bind.world(vm);
     const sel = try bind.str(vm, args, 0);
-    var s = Scratch.init(w);
-    defer s.deinit();
+    defer resetQueryArena(w);
     var out: std.ArrayList(*Node) = .empty;
-    css.querySelectorAll(n, sel, s.arena.allocator(), &out) catch |e| return selectorError(vm, e, sel);
+    css.querySelectorAll(n, sel, w.query_arena.allocator(), &out) catch |e| return selectorError(vm, e, sel);
     return collections.staticList(w, n, out.items);
 }
 
 fn matches(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const n = try elementOf(vm, this);
+    const w = bind.world(vm);
     const sel = try bind.str(vm, args, 0);
-    var s = Scratch.init(bind.world(vm));
-    defer s.deinit();
-    return Value.fromBool(css.matchesSelector(n, sel, s.arena.allocator()) catch |e| return selectorError(vm, e, sel));
+    defer resetQueryArena(w);
+    return Value.fromBool(css.matchesSelector(n, sel, w.query_arena.allocator()) catch |e| return selectorError(vm, e, sel));
 }
 
 fn closest(vm: *Vm, this: Value, args: []const Value) Error!Value {
     const n = try elementOf(vm, this);
+    const w = bind.world(vm);
     const sel = try bind.str(vm, args, 0);
-    var s = Scratch.init(bind.world(vm));
-    defer s.deinit();
-    const found = css.closest(n, sel, s.arena.allocator()) catch |e| return selectorError(vm, e, sel);
+    defer resetQueryArena(w);
+    const found = css.closest(n, sel, w.query_arena.allocator()) catch |e| return selectorError(vm, e, sel);
     return bind.wrap(vm, found);
 }
 

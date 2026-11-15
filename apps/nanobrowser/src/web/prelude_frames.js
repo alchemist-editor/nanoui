@@ -66,8 +66,6 @@ $.hook("makeRemote", (peer, id, callable, array) => {
   // An array must remain an array to Array.isArray and structuredClone.
   p = new Proxy(callable ? function () {} : array ? [] : {}, {
     get(_, k) {
-      const left = orphan();
-      if (left) return left[k];
       const s = state();
       if (s === cross) return far()[k];
       if (isWindow) {
@@ -77,6 +75,10 @@ $.hook("makeRemote", (peer, id, callable, array) => {
       if (k === Symbol.iterator) return call(9, "iterator");
       if (typeof k === "symbol") return k === Symbol.toStringTag ? call(0, "constructor")?.name : undefined;
       const v = call(0, k);
+      if (v === undefined && callable) {
+        const left = orphan();
+        if (left) return left[k];
+      }
       if (isWindow && typeof v === "function" && typeof g[k] === "function") localOf.set(v, g[k]);
       return v;
     },
@@ -129,8 +131,8 @@ $.hook("remoteOp", (op, o, a, b) => {
     // Preserve hidden properties, including Object.prototype.__proto__: for-in
     // must not turn an attributes copy across frames into prototype replacement.
     case 5: return Object.getOwnPropertyDescriptor(o, a)?.enumerable;
-    case 6: return Reflect.apply(o, a, argumentList(b));
-    case 7: return Reflect.construct(o, argumentList(a));
+    case 6: return Reflect.apply(o, a, b);
+    case 7: return Reflect.construct(o, a);
     case 8: return Object.getPrototypeOf(o);
     case 9: return o[Symbol[a]];
     case 10: return o instanceof g.MessagePort || $.remotePort(o);

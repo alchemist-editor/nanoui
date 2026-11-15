@@ -62,6 +62,7 @@ pub const Page = struct {
     title_stale: bool = true,
 
     layout_arena: std.heap.ArenaAllocator,
+    prev_layout_arena: std.heap.ArenaAllocator,
     /// The display list's own: a style change that moves nothing makes it again
     /// alone, each frame of an animation say.
     list_arena: std.heap.ArenaAllocator,
@@ -174,6 +175,7 @@ pub const Page = struct {
             .doc = undefined,
             .engine = undefined,
             .layout_arena = .init(gpa),
+            .prev_layout_arena = .init(gpa),
             .list_arena = .init(gpa),
             .gradients = .{ .gpa = gpa },
         };
@@ -201,6 +203,7 @@ pub const Page = struct {
         if (p.js) |w| w.destroy();
         p.engine.deinit();
         p.layout_arena.deinit();
+        p.prev_layout_arena.deinit();
         p.list_arena.deinit();
         p.scrolls.deinit(gpa);
         p.widths.deinit(gpa);
@@ -331,7 +334,14 @@ pub const Page = struct {
             p.maybeFree();
         }
         if (final.len > 0 and !std.mem.eql(u8, final, p.final_url)) {
-            const copy = p.gpa.dupe(u8, final) catch p.final_url;
+            const hash = if (std.mem.indexOfScalar(u8, final, '#') == null)
+                if (std.mem.indexOfScalar(u8, p.final_url, '#')) |i| p.final_url[i..] else ""
+            else
+                "";
+            const copy = if (hash.len > 0)
+                std.fmt.allocPrint(p.gpa, "{s}{s}", .{ final, hash }) catch p.final_url
+            else
+                p.gpa.dupe(u8, final) catch p.final_url;
             if (copy.ptr != p.final_url.ptr) {
                 p.gpa.free(p.final_url);
                 p.final_url = copy;

@@ -18,6 +18,7 @@ const str = @import("string.zig");
 const exotic = @import("props_exotic.zig");
 const define = @import("props_define.zig");
 const interp = @import("interp_call.zig");
+const conv = @import("conv.zig");
 
 pub const defineOwn = define.defineOwn;
 pub const Desc = define.Desc;
@@ -34,6 +35,12 @@ const max_dense_gap = 1024;
 pub inline fn callGetter(vm: *Vm, slot: Value, receiver: Value) Error!Value {
     const a: *heap.Accessor = @fieldParentPtr("cell", slot.asCell());
     if (a.get.isUndefined()) return Value.undefined;
+    if (a.get.isObject()) {
+        const go = a.get.asObject();
+        if (go.class == .native and !go.flags.host_class) {
+            return interp.callNative(vm, go, receiver, &.{});
+        }
+    }
     return interp.call(vm, a.get, receiver, &.{});
 }
 
@@ -61,6 +68,37 @@ pub fn materialize(vm: *Vm, o: *Object) Error!void {
         .native => {
             name = o.payload.native.name;
             arity = o.payload.native.arity;
+        },
+        .bound => {
+            var cur = o.payload.bound.target;
+            var sub_args: i64 = @intCast(o.payload.bound.args.len);
+            var depth: usize = 1;
+            while (cur.class == .bound and cur.flags.lazy_fn and cur.shape == vm.fn_root) {
+                sub_args += @intCast(cur.payload.bound.args.len);
+                depth += 1;
+                cur = cur.payload.bound.target;
+            }
+            var base_len: i64 = 0;
+            var base_name: *str.JSString = vm.empty;
+            if (cur.flags.lazy_fn and cur.shape == vm.fn_root) {
+                switch (cur.class) {
+                    .closure => { base_len = cur.payload.fp.length; base_name = cur.payload.fp.name; },
+                    .native => { base_len = cur.payload.native.arity; base_name = cur.payload.native.name; },
+                    else => {},
+                }
+            } else {
+                if (try hasOwn(vm, cur, vm.k.length)) {
+                    const l = try get(vm, cur, vm.k.length);
+                    if (l.isNumber()) base_len = @intFromFloat(@max(0, try conv.toIntegerOrInf(vm, l)));
+                }
+                const nv = try get(vm, cur, vm.k.name);
+                if (nv.isString()) base_name = nv.asString();
+            }
+            arity = @intCast(@max(0, base_len - sub_args));
+            const prefix = try str.fromUtf8(vm, "bound ");
+            name = base_name;
+            var d: usize = 0;
+            while (d < depth) : (d += 1) name = try str.concat(vm, prefix, name);
         },
         else => {},
     }
@@ -206,6 +244,10 @@ fn setFound(vm: *Vm, o: *Object, s: u32, key: PropKey, val: Value, receiver: Val
     }
     if (!f.writable) return false;
     if (own) {
+        if (o.flags.is_proto and key.isIndex()) {
+            o.flags.proto_dirty = true;
+            vm.bumpProtoEpoch();
+        }
         o.slots[s] = val;
         return true;
     }
@@ -224,6 +266,10 @@ fn setOnReceiver(vm: *Vm, r: *Object, key: PropKey, val: Value) Error!bool {
 /// Adds a property known not to exist yet, ignoring extensibility. Index keys
 /// land in dense storage when they are near it and the flags are the defaults.
 pub fn addProp(vm: *Vm, o: *Object, key: PropKey, val: Value, flags: PropFlags) Error!void {
+    if (o.flags.is_proto) {
+        o.flags.proto_dirty = true;
+        vm.bumpProtoEpoch();
+    }
     if (key.isIndex()) {
         const i = key.index();
         if (@as(u8, @bitCast(flags)) == @as(u8, @bitCast(PropFlags.all)) and !o.flags.elems_sealed and !o.flags.elems_frozen) {
@@ -311,6 +357,10 @@ pub fn delete(vm: *Vm, o: *Object, key: PropKey) Error!bool {
     }
     const s = o.shape.find(key) orelse return true;
     if (!o.shape.flagsAt(s).configurable) return false;
+    if (o.flags.is_proto) {
+        o.flags.proto_dirty = true;
+        vm.bumpProtoEpoch();
+    }
     if (!o.shape.is_dict) o.shape = try shape_mod.toDict(vm, o.shape, o.shape.proto);
     shape_mod.dictRemove(o.shape, s);
     o.slots[s] = Value.undefined;
@@ -321,6 +371,10 @@ pub fn delete(vm: *Vm, o: *Object, key: PropKey) Error!bool {
 /// Moves an object's prototype; other objects sharing the old shape are untouched.
 pub fn setProtoRaw(vm: *Vm, o: *Object, proto: ?*Object) Error!void {
     if (o.shape.proto == proto) return;
+    if (o.flags.is_proto) {
+        o.flags.proto_dirty = true;
+        vm.bumpProtoEpoch();
+    }
     if (o.shape.is_dict) {
         const d = try shape_mod.toDict(vm, o.shape, proto);
         o.shape = d;

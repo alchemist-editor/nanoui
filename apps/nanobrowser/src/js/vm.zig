@@ -22,6 +22,7 @@ const promise = @import("promise.zig");
 const module = @import("module.zig");
 const regexp_compile = @import("regexp_compile.zig");
 const b_regexp = @import("b_regexp.zig");
+const jit = @import("jit.zig");
 
 pub const Error = error{ Thrown, Terminated, OutOfMemory };
 
@@ -42,6 +43,7 @@ pub const Names = struct {
     then: PropKey = PropKey.none,
     get: PropKey = PropKey.none,
     set: PropKey = PropKey.none,
+    has: PropKey = PropKey.none,
     enumerable: PropKey = PropKey.none,
     configurable: PropKey = PropKey.none,
     writable: PropKey = PropKey.none,
@@ -183,6 +185,20 @@ pub const Protos = struct {
 
 pub const max_frames = 12000;
 pub const stack_slots = 1024 * 1024;
+pub const mega_ic_size = 8192;
+
+pub const MegaICEntry = extern struct {
+    pub const acc_flag: u32 = 0x8000_0000;
+    shape: ?*Shape = null,
+    key_bits: u64 = 0,
+    holder: ?*Object = null,
+    holder_shape: ?*Shape = null,
+    slot: u32 = 0,
+    epoch: u32 = 0,
+};
+
+threadlocal var cached_stacks: [2]?[]Value = .{ null, null };
+threadlocal var cached_frames: [2]?[]frames.Frame = .{ null, null };
 
 /// Whole pages straight from the OS, left untouched so they commit only when reached.
 fn pages(comptime T: type, n: usize) Error![]T {
@@ -190,6 +206,46 @@ fn pages(comptime T: type, n: usize) Error![]T {
     const raw = a.rawAlloc(n * @sizeOf(T), .of(T), @returnAddress()) orelse return error.OutOfMemory;
     const p: [*]T = @ptrCast(@alignCast(raw));
     return p[0..n];
+}
+
+fn allocStack() Error![]Value {
+    for (&cached_stacks) |*slot| {
+        if (slot.*) |s| {
+            slot.* = null;
+            return s;
+        }
+    }
+    return pages(Value, stack_slots);
+}
+
+fn freeStack(s: []Value) void {
+    for (&cached_stacks) |*slot| {
+        if (slot.* == null) {
+            slot.* = s;
+            return;
+        }
+    }
+    std.heap.page_allocator.free(s);
+}
+
+fn allocFrames() Error![]frames.Frame {
+    for (&cached_frames) |*slot| {
+        if (slot.*) |f| {
+            slot.* = null;
+            return f;
+        }
+    }
+    return pages(frames.Frame, max_frames);
+}
+
+fn freeFrames(f: []frames.Frame) void {
+    for (&cached_frames) |*slot| {
+        if (slot.* == null) {
+            slot.* = f;
+            return;
+        }
+    }
+    std.heap.page_allocator.free(f);
 }
 
 pub const Vm = struct {
@@ -208,6 +264,10 @@ pub const Vm = struct {
     array_root: *Shape = undefined,
     fn_root: *Shape = undefined,
     iter_result_shape: *Shape = undefined,
+    args_strict_shape: *Shape = undefined,
+    args_sloppy_shape: *Shape = undefined,
+    regexp_shape: *Shape = undefined,
+    regexp_match_shape: *Shape = undefined,
     function_has_instance: *Object = undefined,
     intl_protos: [6]*Object = undefined,
     regex_cache: std.StringHashMapUnmanaged(*regexp_compile.Program) = .empty,
@@ -215,12 +275,17 @@ pub const Vm = struct {
     global_lex: *Object = undefined,
     empty: *JSString = undefined,
     char_strs: [128]*JSString = undefined,
+    kw_atoms: [37]?*JSString = @splat(null),
 
     // Execution state.
     stack: []Value = &.{},
+    stack_end: usize = 0,
     sp: [*]Value = undefined,
     frames: []frames.Frame = &.{},
     frame_top: u32 = 0,
+    fast_call_stub: ?*const anyopaque = null,
+    fast_getter_stub: ?*const anyopaque = null,
+    fast_args_apply_stub: ?*const anyopaque = null,
     /// Native re-entry depth; the native stack limit is set when it is zero.
     depth: u32 = 0,
     stack_limit: usize = 0,
@@ -263,38 +328,78 @@ pub const Vm = struct {
     rng: u64 = 0x9E3779B97F4A7C15,
     /// Scratch for JSON and join cycle detection.
     visiting: std.ArrayList(*Object) = .empty,
+    /// Bumped whenever an object with `flags.is_proto` changes shape or prototype,
+    /// invalidating multi-hop prototype inline cache entries in O(1).
+    proto_epoch: u32 = 1,
+    jit_pool: jit.JitPool = .{},
+    mega_ic: *[mega_ic_size]MegaICEntry = undefined,
 
     pub const interrupt_interval = 16384;
+
+    pub inline fn bumpProtoEpoch(vm: *Vm) void {
+        vm.proto_epoch +%= 1;
+        if (vm.proto_epoch == 0) vm.proto_epoch = 1;
+    }
+
+    pub inline fn clearMegaIC(vm: *Vm) void {
+        @memset(vm.mega_ic, .{});
+    }
+
+    pub inline fn megaSlot(vm: *Vm, sh: *const Shape, key_bits: u64) *MegaICEntry {
+        const h = ((@intFromPtr(sh) >> 4) ^ (key_bits >> 3) ^ (key_bits >> 19)) & (mega_ic_size - 1);
+        return &vm.mega_ic[h];
+    }
 
     pub fn create(gpa_in: Allocator) Error!*Vm {
         const vm = try gpa_in.create(Vm);
         errdefer gpa_in.destroy(vm);
+        const mega = try gpa_in.create([mega_ic_size]MegaICEntry);
+        errdefer gpa_in.destroy(mega);
+        @memset(mega, .{});
         vm.* = .{
             .gpa = undefined,
             .raw_gpa = gpa_in,
             .counting = .{ .gpa = gpa_in },
             .heap = undefined,
+            .mega_ic = mega,
         };
         vm.gpa = vm.counting.allocator();
         vm.heap = .{ .gpa = vm.gpa };
-        vm.stack = try pages(Value, stack_slots);
+        vm.stack = try allocStack();
+        vm.stack_end = @intFromPtr(vm.stack.ptr) + vm.stack.len * @sizeOf(Value);
         vm.sp = vm.stack.ptr;
-        vm.frames = try pages(frames.Frame, max_frames);
+        vm.frames = try allocFrames();
+        vm.fast_call_stub = jit.getFastCallStub();
+        vm.fast_getter_stub = jit.getFastGetterStub();
+        vm.fast_args_apply_stub = jit.getFastArgsApplyStub();
         try vm.initStrings();
         try builtins.init(vm);
+        vm.protos.object.flags.proto_dirty = false;
+        vm.protos.array.flags.proto_dirty = false;
+        vm.protos.array_ctor.flags.is_proto = true;
+        vm.protos.array_ctor.flags.proto_dirty = false;
+        vm.protos.array_iter.flags.proto_dirty = false;
+        vm.protos.regexp.flags.proto_dirty = false;
+        vm.protos.string.flags.is_proto = true;
+        vm.protos.number.flags.is_proto = true;
+        vm.protos.boolean.flags.is_proto = true;
         return vm;
     }
 
     fn initStrings(vm: *Vm) Error!void {
-        const empty = try vm.gpa.dupe(u8, "");
         const e = try vm.heap.create(JSString, .string);
-        e.* = .{ .cell = e.cell, .is_ascii = true, .is_atom = true, .byte_len = 0, .len16 = 0, .ptr = empty.ptr };
-        try vm.atoms.put(vm.gpa, e.ptr[0..0], e);
+        e.* = .{ .cell = e.cell, .is_ascii = true, .is_atom = true, .byte_len = 0, .len16 = 0, .ptr = &e.inline_buf };
+        e.key = PropKey.fromAtom(e);
+        try vm.atoms.put(vm.gpa, e.inline_buf[0..0], e);
         vm.empty = e;
         var i: usize = 0;
         while (i < 128) : (i += 1) {
-            const b = [1]u8{@intCast(i)};
-            vm.char_strs[i] = try str.intern(vm, &b);
+            const c = try vm.heap.create(JSString, .string);
+            c.* = .{ .cell = c.cell, .is_ascii = true, .is_atom = true, .owns = false, .byte_len = 1, .len16 = 1, .ptr = &c.inline_buf };
+            c.inline_buf[0] = @intCast(i);
+            c.key = if (i >= '0' and i <= '9') PropKey.fromIndex(@intCast(i - '0')) else PropKey.fromAtom(c);
+            try vm.atoms.put(vm.gpa, c.inline_buf[0..1], c);
+            vm.char_strs[i] = c;
         }
         inline for (@typeInfo(Names).@"struct".field_names) |n| {
             @field(vm.k, n) = PropKey.fromAtom(try str.intern(vm, n));
@@ -321,8 +426,10 @@ pub const Vm = struct {
         vm.protected.deinit(vm.gpa);
         vm.modules.deinit(vm.gpa);
         vm.visiting.deinit(vm.gpa);
-        std.heap.page_allocator.free(vm.stack);
-        std.heap.page_allocator.free(vm.frames);
+        vm.jit_pool.deinit(raw);
+        freeStack(vm.stack);
+        freeFrames(vm.frames);
+        raw.destroy(vm.mega_ic);
         raw.destroy(vm);
     }
 
@@ -333,6 +440,7 @@ pub const Vm = struct {
         m.mark(vm.exception);
         m.markStr(vm.empty);
         for (vm.char_strs) |s| m.markStr(s);
+        for (vm.kw_atoms) |s| if (s) |a| m.markStr(a);
         inline for (@typeInfo(Names).@"struct".field_names) |n| m.markKey(@field(vm.k, n));
         inline for (@typeInfo(WellKnown).@"struct".field_names) |n| m.markCell(&@field(vm.sym, n).cell);
         inline for (@typeInfo(Protos).@"struct".field_names) |n| {
@@ -350,6 +458,10 @@ pub const Vm = struct {
         for (vm.intl_protos) |o| m.markObj(o);
         for (vm.pending_rejections.items) |o| m.markObj(o);
         m.markCell(&vm.iter_result_shape.cell);
+        m.markCell(&vm.args_strict_shape.cell);
+        m.markCell(&vm.args_sloppy_shape.cell);
+        m.markCell(&vm.regexp_shape.cell);
+        m.markCell(&vm.regexp_match_shape.cell);
         var it = vm.symbol_registry.valueIterator();
         while (it.next()) |s| m.markCell(&s.*.cell);
         var pi = vm.protected.keyIterator();
@@ -392,6 +504,7 @@ pub const Vm = struct {
     pub const global = api.global;
     // Values.
     pub const newString = api.newString;
+    pub const internString = api.internString;
     pub const toStringSlice = api.toStringSlice;
     pub const toNumber = api.toNumber;
     pub const toBoolean = api.toBoolean;
@@ -416,5 +529,6 @@ pub const Vm = struct {
     pub const setIndexed = api.setIndexed;
     pub const defineMethodOn = api.defineMethodOn;
     pub const defineAccessorOn = api.defineAccessorOn;
+    pub const defineAccessorValueOn = api.defineAccessorValueOn;
     pub const defineDataOn = api.defineDataOn;
 };

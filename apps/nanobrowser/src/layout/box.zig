@@ -48,7 +48,49 @@ pub const Font = struct {
     tabular: bool = false,
     /// CSS turns off standard ligatures when letters are spaced.
     ligatures: bool = true,
+    /// True when `family` names a page-scoped `@font-face` (`@<id>/...`).
+    scoped: bool = false,
+    hash: u64 = 0,
+
+    pub inline fn isScoped(font: Font) bool {
+        return font.scoped or (font.hash == 0 and std.mem.indexOfScalar(u8, font.family, '@') != null);
+    }
+
+    pub fn key(font: Font) u64 {
+        if (font.hash != 0) return font.hash;
+        return computeFontHash(font);
+    }
+
+    pub fn wordKey(font: Font, text: []const u8) u64 {
+        const fk = font.key();
+        if (text.len <= 8) {
+            var w: u64 = 0;
+            for (text, 0..) |b, i| w |= @as(u64, b) << @intCast(i * 8);
+            var x = fk ^ (w *% 0x9E3779B97F4A7C15) ^ (@as(u64, text.len) *% 0x517CC1B727220A95);
+            x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
+            x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
+            return x ^ (x >> 31);
+        }
+        return std.hash.Wyhash.hash(fk, text);
+    }
 };
+
+fn computeFontHash(font: Font) u64 {
+    const bits: u64 = @as(u32, @bitCast(font.size));
+    const flags: u64 = @intFromBool(font.italic) |
+        (@as(u64, @intFromBool(font.mono)) << 1) |
+        (@as(u64, @intFromBool(font.serif)) << 2) |
+        (@as(u64, @intFromBool(font.tabular)) << 3) |
+        (@as(u64, @intFromBool(font.ligatures)) << 4) |
+        (@as(u64, font.weight) << 8) |
+        (@as(u64, font.stretch) << 24) |
+        (bits << 32);
+    const h = if (font.family.len == 0)
+        flags *% 0x9E3779B97F4A7C15 ^ 0xBF58476D1CE4E5B9
+    else
+        std.hash.Wyhash.hash(flags, font.family);
+    return if (h == 0) 1 else h;
+}
 
 pub const Metrics = struct {
     ascent: f32 = 12.8,
@@ -69,6 +111,9 @@ pub const Measurer = struct {
     /// A picture's own size; a negative `w`: it has none, and `h` is its shape
     /// (width over height), as an SVG with only a viewBox.
     image: *const fn (ctx: *anyopaque, node: *dom.Node) ?Size,
+    widths: ?*std.AutoHashMapUnmanaged(u64, f32) = null,
+    widths_gpa: ?std.mem.Allocator = null,
+    shared_ok: bool = false,
 };
 
 pub const Kind = enum {
@@ -228,6 +273,28 @@ pub const Notes = struct {
     sub_row_gap: f32 = 0,
     /// A table's analysed grid (`table.zig`).
     table: ?*anyopaque = null,
+    /// Clean-subtree layout cache state (`layout/cache.zig`).
+    cache_gen: u32 = 0,
+    reusable: bool = false,
+    flow_reusable: bool = false,
+    adopted: bool = false,
+    advances_list_counter: bool = false,
+    bad_subtree: bool = false,
+    uncontained_abs: bool = false,
+    unscoped_li: bool = false,
+    has_float: bool = false,
+    no_top_collapse: bool = false,
+    no_bottom_collapse: bool = false,
+    in_text_align: ?style.TextAlign = null,
+    in_nowrap: bool = false,
+    cached_style: ?*const Style = null,
+    old_style: ?*const Style = null,
+    cached_page_x: f32 = 0,
+    cached_page_y: f32 = 0,
+    cached_flow_cw: f32 = -1,
+    cached_flow_ch: f32 = -2,
+    cached_out_w: f32 = 0,
+    cached_out_h: f32 = 0,
 };
 
 pub const Box = struct {
@@ -302,7 +369,20 @@ pub const Box = struct {
 };
 
 pub fn fontOf(s: *const Style) Font {
-    return .{ .size = s.font_size, .weight = s.font_weight, .italic = s.italic, .mono = s.mono, .serif = s.serif, .family = s.font_family, .stretch = s.font_stretch, .tabular = s.tabular, .ligatures = s.letter_spacing == 0 };
+    var f: Font = .{
+        .size = s.font_size,
+        .weight = s.font_weight,
+        .italic = s.italic,
+        .mono = s.mono,
+        .serif = s.serif,
+        .family = s.font_family,
+        .stretch = s.font_stretch,
+        .tabular = s.tabular,
+        .ligatures = s.letter_spacing == 0,
+        .scoped = std.mem.indexOfScalar(u8, s.font_family, '@') != null,
+    };
+    f.hash = computeFontHash(f);
+    return f;
 }
 
 /// The result of a layout.

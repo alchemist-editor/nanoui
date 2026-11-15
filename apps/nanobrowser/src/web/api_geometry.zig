@@ -14,6 +14,7 @@ const classes = @import("classes.zig");
 const display = @import("../paint/display.zig");
 const css_transform = @import("../css/transform.zig");
 const css_style = @import("../css/style.zig");
+const perf = @import("../perf_rules.zig");
 const Node = dom.Node;
 const Value = js.Value;
 const Vm = js.Vm;
@@ -26,7 +27,13 @@ pub fn flushStyle(w: *World) void {
     view.flushStyle(w.page);
 }
 
-/// Style and layout up to date. False when there is no context to measure with.
+/// Cone-scoped style flush for `getComputedStyle(n)`.
+pub fn flushStyleForNode(w: *World, n: *Node) void {
+    page_loader.sheetsNow(w.page);
+    view.flushStyleForNode(w.page, n);
+}
+
+/// Style and box layout (`p.tree`) up to date. False when there is no context to measure with.
 pub fn flushLayout(w: *World) bool {
     const p = w.page;
     if (w.painting) return p.tree != null;
@@ -34,11 +41,26 @@ pub fn flushLayout(w: *World) bool {
     const size = p.host.viewport(p.host.ctx);
     const vw = if (p.viewport_w > 0) p.viewport_w else size[0];
     const vh = if (p.viewport_h > 0) p.viewport_h else size[1];
-    if (!p.doc.style_dirty and !p.doc.layout_dirty and !p.list_dirty and p.list != null and vw == p.viewport_w and vh == p.viewport_h) return true;
+    if (!perf.needsLayoutFlush(p.doc.style_dirty, p.doc.layout_dirty or p.doc.oof_dirty_node != null, p.tree != null, vw == p.viewport_w, vh == p.viewport_h)) return true;
     const c = p.host.uiContext(p.host.ctx) orelse return false;
-    view.prepare(p, c, vw, vh);
-    if (p.list) |*l| l.resolve(p.origin[0], p.origin[1], p.viewport_w, p.viewport_h);
+    view.flushLayoutOnly(p, c, vw, vh);
     return p.tree != null;
+}
+
+/// Style, layout and display list (`p.list`) up to date, for hit testing and scrolling.
+pub fn flushDisplayList(w: *World) bool {
+    const p = w.page;
+    if (w.painting) return p.list != null;
+    page_loader.sheetsNow(p);
+    const size = p.host.viewport(p.host.ctx);
+    const vw = if (p.viewport_w > 0) p.viewport_w else size[0];
+    const vh = if (p.viewport_h > 0) p.viewport_h else size[1];
+    if (perf.needsPrepare(p.doc.style_dirty, p.doc.layout_dirty or p.doc.oof_dirty_node != null, p.list_dirty, p.doc.svg_dirty, p.list != null) or vw != p.viewport_w or vh != p.viewport_h) {
+        const c = p.host.uiContext(p.host.ctx) orelse return false;
+        view.prepare(p, c, vw, vh);
+    }
+    if (p.list) |*l| l.resolve(p.origin[0], p.origin[1], p.viewport_w, p.viewport_h);
+    return p.list != null;
 }
 
 fn thisElement(vm: *Vm, this: Value) Error!*Node {
@@ -78,7 +100,7 @@ fn scrollOffset(p: anytype, n: *Node) [2]f32 {
 }
 
 pub fn docScroll(p: anytype) [2]f32 {
-    if (p.list) |l| if (l.clips.len > 1) return .{ l.clips[1].scroll_x, l.clips[1].scroll_y };
+    if (!p.list_dirty) if (p.list) |l| if (l.clips.len > 1) return .{ l.clips[1].scroll_x, l.clips[1].scroll_y };
     return p.scrolls.get(p.doc.node) orelse .{ 0, 0 };
 }
 
@@ -116,8 +138,25 @@ fn transformedRect(n: *Node, r_in: box.Rect) box.Rect {
 }
 
 fn makeRect(vm: *Vm, r: box.Rect) Error!Value {
+    const w = bind.world(vm);
+    if (w.rect_shape) |rs| if (w.rect_epoch == vm.proto_epoch) {
+        const o = try js.allocObjectWithShape(vm, rs, .object);
+        o.slots[0] = .fromNumber(r.x);
+        o.slots[1] = .fromNumber(r.y);
+        o.slots[2] = .fromNumber(r.w);
+        o.slots[3] = .fromNumber(r.h);
+        return o.value();
+    };
     const args = [_]Value{ .fromNumber(r.x), .fromNumber(r.y), .fromNumber(r.w), .fromNumber(r.h) };
-    return vm.call(bind.world(vm).h.makeRect, Value.undefined, &args);
+    const res = try vm.call(w.h.makeRect, Value.undefined, &args);
+    if (res.isObject()) {
+        const ro = res.asObject();
+        if (ro.class == .object and !ro.shape.is_dict and ro.shape.count == 4 and ro.slot_cap >= 4) {
+            w.rect_shape = ro.shape;
+            w.rect_epoch = vm.proto_epoch;
+        }
+    }
+    return res;
 }
 
 fn getBoundingClientRect(vm: *Vm, this: Value, _: []const Value) Error!Value {
@@ -160,6 +199,7 @@ fn clientWidth(vm: *Vm, this: Value, _: []const Value) Error!Value {
     const n = try thisElement(vm, this);
     const w = bind.world(vm);
     if (isRootElement(n)) {
+        if (w.page.viewport_w > 0) return bind.num(w.page.viewport_w);
         _ = flushLayout(w);
         return bind.num(w.page.viewport_w);
     }
@@ -172,6 +212,7 @@ fn clientHeight(vm: *Vm, this: Value, _: []const Value) Error!Value {
     const n = try thisElement(vm, this);
     const w = bind.world(vm);
     if (isRootElement(n)) {
+        if (w.page.viewport_h > 0) return bind.num(w.page.viewport_h);
         _ = flushLayout(w);
         return bind.num(w.page.viewport_h);
     }
@@ -235,9 +276,9 @@ fn scrollSize(vm: *Vm, this: Value, height: bool) Error!Value {
     const w = bind.world(vm);
     if (!flushLayout(w)) return Value.fromInt(0);
     const p = w.page;
-    if (clipOf(p, n)) |i| {
-        const c = p.list.?.clips[i];
-        return bind.num(@max(if (height) c.content_h else c.content_w, if (height) c.rect.h else c.rect.w));
+    if (isRootElement(n)) {
+        const tree = p.tree orelse return Value.fromInt(0);
+        return bind.num(@max(if (height) tree.doc_h else tree.doc_w, if (height) p.viewport_h else p.viewport_w));
     }
     const b = layout.boxOfNode(n) orelse return Value.fromInt(0);
     const inner = b.paddingRect();
@@ -265,10 +306,41 @@ fn scrollGet(vm: *Vm, this: Value, axis: usize) Error!Value {
 fn scrollTo(w: *World, n: *Node, x: ?f32, y: ?f32) void {
     if (!flushLayout(w)) return;
     const p = w.page;
-    const i = clipOf(p, n) orelse return;
-    const l = &p.list.?;
-    const c = l.clips[i];
-    view.scrollBy(p, l, i, if (x) |v| v - c.scroll_x else 0, if (y) |v| v - c.scroll_y else 0);
+    var key: *Node = undefined;
+    var max_x: f32 = 0;
+    var max_y: f32 = 0;
+    var was: [2]f32 = .{ 0, 0 };
+    if (isRootElement(n)) {
+        const tree = p.tree orelse return;
+        key = p.doc.node;
+        max_x = @max(0, tree.doc_w - p.viewport_w);
+        max_y = @max(0, tree.doc_h - p.viewport_h);
+        was = docScroll(p);
+    } else {
+        const b = layout.boxOfNode(n) orelse return;
+        if (!b.style.clips() or b.kind == .inline_box) return;
+        const pad = b.paddingRect();
+        key = n;
+        max_x = @max(0, b.content_w - pad.w);
+        max_y = @max(0, b.content_h - pad.h);
+        was = p.scrolls.get(n) orelse .{ 0, 0 };
+    }
+    const nx = std.math.clamp(x orelse was[0], 0, max_x);
+    const ny = std.math.clamp(y orelse was[1], 0, max_y);
+    p.glide = null;
+    p.restore_scroll = 0;
+    if (nx != was[0] or ny != was[1]) p.hover_held_until = p.engine.now + 0.12;
+    if (!p.list_dirty) if (clipOf(p, n)) |i| {
+        const l = &p.list.?;
+        const c = &l.clips[i];
+        if (c.scroll_x != nx or c.scroll_y != ny) {
+            c.scroll_x = nx;
+            c.scroll_y = ny;
+            l.scroll_rev +%= 1;
+        }
+    };
+    p.scrolls.put(p.gpa, key, .{ nx, ny }) catch {};
+    @import("web.zig").scrolled(p, key);
     w.changed();
 }
 
@@ -313,10 +385,9 @@ fn scrollArgs(vm: *Vm, n: *Node, args: []const Value, by: bool) Error!void {
     }
     if (by) {
         if (!flushLayout(w)) return;
-        const i = clipOf(w.page, n) orelse return;
-        const c = w.page.list.?.clips[i];
-        if (x) |v| x = v + c.scroll_x;
-        if (y) |v| y = v + c.scroll_y;
+        const cur = if (isRootElement(n)) docScroll(w.page) else (w.page.scrolls.get(n) orelse [2]f32{ 0, 0 });
+        if (x) |v| x = v + cur[0];
+        if (y) |v| y = v + cur[1];
     }
     scrollTo(w, n, x, y);
 }
@@ -356,9 +427,11 @@ fn scrollIntoView(vm: *Vm, this: Value, args: []const Value) Error!Value {
     var at = n.parent;
     while (at) |a| : (at = a.parent) {
         if (a.kind != .element or isRootElement(a)) break;
-        const i = clipOf(p, a) orelse continue;
-        const c = p.list.?.clips[i];
-        if (place(block, b.y - c.rect.y, b.h, c.scroll_y, c.rect.h)) |to| scrollTo(w, a, null, to);
+        const ab = layout.boxOfNode(a) orelse continue;
+        if (!ab.style.clips() or ab.kind == .inline_box) continue;
+        const pad = ab.paddingRect();
+        const sy = (p.scrolls.get(a) orelse [2]f32{ 0, 0 })[1];
+        if (place(block, b.y - pad.y, b.h, sy, pad.h)) |to| scrollTo(w, a, null, to);
     }
     const root = n.doc.documentElement() orelse return Value.undefined;
     if (place(block, b.y, b.h, docScroll(p)[1], p.viewport_h)) |to| scrollTo(w, root, null, to);
@@ -367,7 +440,7 @@ fn scrollIntoView(vm: *Vm, this: Value, args: []const Value) Error!Value {
 
 fn elementFromPoint(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const w = bind.world(vm);
-    if (!flushLayout(w)) return Value.null;
+    if (!flushDisplayList(w)) return Value.null;
     const p = w.page;
     const x: f32 = @floatCast(try vm.toNumber(bind.arg(args, 0)));
     const y: f32 = @floatCast(try vm.toNumber(bind.arg(args, 1)));

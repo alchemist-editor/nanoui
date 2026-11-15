@@ -8,6 +8,7 @@ const sheet = @import("sheet.zig");
 const sel = @import("selectors.zig");
 const match = @import("selector_match.zig");
 const media = @import("media.zig");
+const perf = @import("../perf_rules.zig");
 
 const Declarations = sheet.Declarations;
 
@@ -17,6 +18,8 @@ pub const Entry = struct {
     /// Sorting by this gives cascade order, lowest first: origin, layer,
     /// specificity, source order.
     key: u64,
+    ancestor_bloom: u64 = 0,
+    attr_bloom: u64 = 0,
     layer: u16,
     ua: bool,
     /// The `@container` it sits under: checked when an element has matched it.
@@ -51,6 +54,30 @@ fn makeKey(ua: bool, layer: u16, specificity: u32, order: u32) u64 {
     return (@as(u64, @intFromBool(!ua)) << 63) | (@as(u64, layer) << 51) | (spec << 27) | @min(order, (1 << 27) - 1);
 }
 
+pub const RuleReq = @import("subject_mask.zig").RuleReq;
+pub const SubjectMask = @import("subject_mask.zig").SubjectMask;
+
+fn compoundHasPositional(c: *const sel.Compound) bool {
+    for (c.simples) |x| switch (x) {
+        .nth, .has => return true,
+        .pseudo => |p| switch (p) {
+            .first_child, .last_child, .only_child, .first_of_type, .last_of_type, .only_of_type, .empty => return true,
+            else => {},
+        },
+        .not, .is, .host, .host_context => |l| for (l) |*sub| if (selectorHasPositionalOrSibling(sub)) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn selectorHasPositionalOrSibling(s: *const sel.Selector) bool {
+    for (s.compounds, 0..) |*c, idx| {
+        if (idx > 0 and (c.combinator == .next or c.combinator == .later)) return true;
+        if (compoundHasPositional(c)) return true;
+    }
+    return false;
+}
+
 pub const Index = struct {
     arena: std.heap.ArenaAllocator,
     ids: Map = .empty,
@@ -65,9 +92,207 @@ pub const Index = struct {
     parts: List = .empty,
     /// Some author rule uses `:has`: a change can reach its ancestors.
     uses_has: bool = false,
+    /// Some rule uses `+` (`.next`) or `~` / `:nth-child(of S)` (`.later`).
+    uses_next_sibling: bool = false,
+    uses_later_sibling: bool = false,
+    uses_ancestor_positional: bool = false,
+    uses_attr_before_next: bool = false,
+    uses_focus_within: bool = false,
+    uses_nth_or_type: bool = false,
+    any_first: bool = false,
+    any_last: bool = false,
+    any_empty: bool = false,
+    unshareable_subj: SubjectMask = .{},
+    first_subj: SubjectMask = .{},
+    last_subj: SubjectMask = .{},
+    empty_subj: SubjectMask = .{},
+    next_subj: SubjectMask = .{},
+    anc_pos_subj: SubjectMask = .{},
+    /// 64-bit Bloom filter of attribute names in `[attr]` selectors.
+    attr_filter: u64 = 0,
+    referenced_ids_bloom: u64 = 0,
+    referenced_ids: std.StringHashMapUnmanaged(void) = .empty,
+    referenced_attrs: std.StringHashMapUnmanaged(void) = .empty,
     /// Some rule sits under `@container`.
     uses_container: bool = false,
+    uses_host_in_subtree: bool = false,
     quirks: bool = false,
+
+    pub inline fn mentionsId(ix: *const Index, id: []const u8) bool {
+        if ((perf.attrBit(id) & ix.referenced_ids_bloom) == 0) return false;
+        return ix.referenced_ids.contains(id);
+    }
+
+    pub inline fn mentionsAttr(ix: *const Index, lower_name: []const u8) bool {
+        if ((perf.attrBit(lower_name) & ix.attr_filter) == 0) return false;
+        return ix.referenced_attrs.contains(lower_name);
+    }
+
+    pub fn ruleFlags(ix: *const Index) u8 {
+        return @as(u8, @intFromBool(ix.uses_has)) |
+            (@as(u8, @intFromBool(ix.uses_next_sibling)) << 1) |
+            (@as(u8, @intFromBool(ix.uses_later_sibling)) << 2) |
+            (@as(u8, @intFromBool(ix.uses_nth_or_type)) << 3) |
+            (@as(u8, @intFromBool(ix.any_first)) << 4) |
+            (@as(u8, @intFromBool(ix.any_last)) << 5) |
+            (@as(u8, @intFromBool(ix.any_empty)) << 6);
+    }
+
+    fn scanAttrAndHas(ix: *Index, selector: *const sel.Selector, ua: bool, before_next_outer: bool) void {
+        for (selector.compounds, 0..) |*c, idx| {
+            const is_subject = idx + 1 == selector.compounds.len;
+            const before_next = before_next_outer or (!is_subject and selector.compounds[idx + 1].combinator == .next);
+            if (!ua and idx > 0) switch (c.combinator) {
+                .next => {
+                    ix.uses_next_sibling = true;
+                    if (before_next) ix.uses_nth_or_type = true;
+                },
+                .later => ix.uses_later_sibling = true,
+                else => {},
+            };
+            for (c.simples) |x| switch (x) {
+                .id => |id| {
+                    ix.referenced_ids_bloom |= perf.attrBit(id);
+                    ix.referenced_ids.put(ix.arena.allocator(), id, {}) catch {};
+                },
+                .attr => |a| {
+                    ix.attr_filter |= perf.attrBit(a.lower);
+                    ix.referenced_attrs.put(ix.arena.allocator(), a.lower, {}) catch {};
+                    if (!ua and before_next) ix.uses_attr_before_next = true;
+                },
+                .pseudo => |p| if (!ua) switch (p) {
+                    .focus_within => ix.uses_focus_within = true,
+                    .first_child => ix.any_first = true,
+                    .last_child => ix.any_last = true,
+                    .only_child => { ix.any_first = true; ix.any_last = true; },
+                    .empty => ix.any_empty = true,
+                    .first_of_type, .last_of_type, .only_of_type => ix.uses_nth_or_type = true,
+                    else => {},
+                },
+                .nth => |n| {
+                    if (!ua) {
+                        if (n.a != 0 or n.b != 1 or n.of_type or n.of.len > 0) ix.uses_nth_or_type = true else if (n.from_end) ix.any_last = true else ix.any_first = true;
+                    }
+                    if (n.of.len > 0) {
+                        ix.uses_later_sibling = true;
+                        for (n.of) |*sub| ix.scanAttrAndHas(sub, ua, before_next);
+                    }
+                },
+                .not, .is, .host, .host_context => |l| for (l) |*sub| ix.scanAttrAndHas(sub, ua, before_next),
+                .has => |l| {
+                    if (!ua) ix.uses_has = true;
+                    for (l) |*sub| ix.scanAttrAndHas(sub, ua, before_next);
+                },
+                else => {},
+            };
+        }
+        for (selector.slotted) |*sub| ix.scanAttrAndHas(sub, ua, false);
+    }
+
+    fn scanSelector(ix: *Index, selector: *const sel.Selector, ua: bool, anc_bloom: u64) void {
+        ix.scanAttrAndHas(selector, ua, false);
+        if (ua or selector.compounds.len == 0) return;
+        const subj_idx = selector.compounds.len - 1;
+        const subj_simples = selector.compounds[subj_idx].simples;
+        var subj_chain_start: usize = subj_idx;
+        while (subj_chain_start > 0) {
+            const comb = selector.compounds[subj_chain_start].combinator;
+            if (comb != .next and comb != .later) break;
+            subj_chain_start -= 1;
+        }
+        for (selector.compounds[0..subj_chain_start], 0..) |*c, idx| {
+            if ((idx > 0 and (c.combinator == .next or c.combinator == .later)) or compoundHasPositional(c)) {
+                ix.uses_ancestor_positional = true;
+                ix.anc_pos_subj.record(subj_simples, anc_bloom);
+                break;
+            }
+        }
+        for (selector.compounds[subj_chain_start..], subj_chain_start..) |*c, idx| {
+            const is_subject = idx == subj_idx;
+            const before_next = !is_subject and selector.compounds[idx + 1].combinator == .next;
+            if (idx > subj_chain_start) switch (c.combinator) {
+                .next => {
+                    ix.next_subj.record(subj_simples, anc_bloom);
+                    if (!is_subject or idx > subj_chain_start + 1) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                },
+                .later => ix.unshareable_subj.record(subj_simples, anc_bloom),
+                else => {},
+            };
+            for (c.simples) |x| switch (x) {
+                .pseudo => |p| switch (p) {
+                    .first_of_type, .last_of_type, .only_of_type => ix.unshareable_subj.record(subj_simples, anc_bloom),
+                    .first_child => {
+                        ix.first_subj.record(subj_simples, anc_bloom);
+                        if (before_next) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                    },
+                    .last_child => {
+                        ix.last_subj.record(subj_simples, anc_bloom);
+                        if (before_next) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                    },
+                    .only_child => {
+                        ix.first_subj.record(subj_simples, anc_bloom);
+                        ix.last_subj.record(subj_simples, anc_bloom);
+                        if (before_next) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                    },
+                    .empty => {
+                        ix.empty_subj.record(subj_simples, anc_bloom);
+                        if (before_next) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                    },
+                    else => {},
+                },
+                .nth => |n| {
+                    if (n.a != 0 or n.b != 1 or n.of_type or n.of.len > 0 or before_next) {
+                        ix.unshareable_subj.record(subj_simples, anc_bloom);
+                    } else if (n.from_end) {
+                        ix.last_subj.record(subj_simples, anc_bloom);
+                    } else {
+                        ix.first_subj.record(subj_simples, anc_bloom);
+                    }
+                },
+                .not, .is => |l| for (l) |*sub| {
+                    recordSubPositional(ix, sub, subj_simples, anc_bloom, !before_next);
+                },
+                .host, .host_context => |l| for (l) |*sub| {
+                    if (selectorHasPositionalOrSibling(sub)) ix.unshareable_subj.record(subj_simples, anc_bloom);
+                },
+                else => {},
+            };
+        }
+    }
+
+    fn recordSubPositional(ix: *Index, sub: *const sel.Selector, subj_simples: []const sel.Simple, anc_bloom: u64, allow_shareable: bool) void {
+        if (!selectorHasPositionalOrSibling(sub)) return;
+        if (!allow_shareable or sub.compounds.len != 1) {
+            ix.unshareable_subj.record(subj_simples, anc_bloom);
+            return;
+        }
+        for (sub.compounds[0].simples) |sx| switch (sx) {
+            .pseudo => |p| switch (p) {
+                .first_child => ix.first_subj.record(subj_simples, anc_bloom),
+                .last_child => ix.last_subj.record(subj_simples, anc_bloom),
+                .only_child => {
+                    ix.first_subj.record(subj_simples, anc_bloom);
+                    ix.last_subj.record(subj_simples, anc_bloom);
+                },
+                .empty => ix.empty_subj.record(subj_simples, anc_bloom),
+                .first_of_type, .last_of_type, .only_of_type => ix.unshareable_subj.record(subj_simples, anc_bloom),
+                else => {},
+            },
+            .nth => |n| {
+                if (n.a != 0 or n.b != 1 or n.of_type or n.of.len > 0) {
+                    ix.unshareable_subj.record(subj_simples, anc_bloom);
+                } else if (n.from_end) {
+                    ix.last_subj.record(subj_simples, anc_bloom);
+                } else {
+                    ix.first_subj.record(subj_simples, anc_bloom);
+                }
+            },
+            .has => ix.unshareable_subj.record(subj_simples, anc_bloom),
+            .not, .is => |l2| for (l2) |*s2| recordSubPositional(ix, s2, subj_simples, anc_bloom, allow_shareable),
+            .host, .host_context => ix.unshareable_subj.record(subj_simples, anc_bloom),
+            else => {},
+        };
+    }
 
     pub fn init(gpa: Allocator) Index {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -90,6 +315,8 @@ pub const Index = struct {
                     .sel = selector,
                     .decls = r.decls,
                     .key = makeKey(ua, layer, selector.specificity, order.*),
+                    .ancestor_bloom = if (ix.quirks) 0 else selectorAncestorBloom(selector),
+                    .attr_bloom = selectorSubjectAttrBloom(selector),
                     .layer = layer,
                     .ua = ua,
                     .container = r.container,
@@ -104,12 +331,7 @@ pub const Index = struct {
                     try ix.host.append(a, entry.outerWeak());
                 } else try ix.add(entry);
                 if (selector.uses_state and !ua) try ix.state_deps.append(ix.arena.allocator(), .{ .sel = selector });
-                if (!ua and !ix.uses_has) {
-                    for (selector.compounds) |*c| for (c.simples) |x| switch (x) {
-                        .has => ix.uses_has = true,
-                        else => {},
-                    };
-                }
+                ix.scanSelector(selector, ua, entry.ancestor_bloom);
             }
         }
     }
@@ -118,6 +340,12 @@ pub const Index = struct {
         const a = ix.arena.allocator();
         const c = e.sel.compounds;
         if (c.len == 0) return ix.universal.append(a, e);
+        if (!ix.uses_host_in_subtree) {
+            for (c) |comp| for (comp.simples) |x| switch (x) {
+                .host, .host_context => ix.uses_host_in_subtree = true,
+                else => {},
+            };
+        }
         const subject = c[c.len - 1].simples;
         var class: ?[]const u8 = null;
         var tag: ?[]const u8 = null;
@@ -150,13 +378,17 @@ pub const Index = struct {
     pub fn collect(ix: *const Index, gpa: Allocator, el: *dom.Node, ctx: *match.Ctx, out: *List) Allocator.Error!void {
         try tryList(gpa, ix.universal.items, el, ctx, out);
         if (el.attrs.items.len > 0) {
-            if (el.attr("id")) |id| if (ix.ids.count() > 0) {
+            if (el.id_attr) |id| if (ix.ids.count() > 0) {
                 if (ix.lookup(&ix.ids, id)) |l| try tryList(gpa, l.items, el, ctx, out);
             };
-            if (el.attr("class")) |classes| if (ix.classes.count() > 0) {
-                var it = std.mem.tokenizeAny(u8, classes, " \t\r\n\x0c");
-                while (it.next()) |c| {
-                    if (ix.lookup(&ix.classes, c)) |l| try tryList(gpa, l.items, el, ctx, out);
+            if (el.class_attr) |classes| if (ix.classes.count() > 0) {
+                if (el.class_single) {
+                    if (ix.lookup(&ix.classes, el.class_src[0..el.class_src_len])) |l| try tryList(gpa, l.items, el, ctx, out);
+                } else {
+                    var it = std.mem.tokenizeAny(u8, classes, " \t\r\n\x0c");
+                    while (it.next()) |c| {
+                        if (ix.lookup(&ix.classes, c)) |l| try tryList(gpa, l.items, el, ctx, out);
+                    }
                 }
             };
         }
@@ -189,13 +421,52 @@ fn isHostRule(s: *const sel.Selector) bool {
     return false;
 }
 
+fn selectorAncestorBloom(s: *const sel.Selector) u64 {
+    if (s.compounds.len <= 1 or s.pseudo == .slotted or s.pseudo == .part) return 0;
+    for (s.compounds) |c| for (c.simples) |x| switch (x) {
+        .host, .host_context => return 0,
+        else => {},
+    };
+    var bloom: u64 = 0;
+    var i: usize = s.compounds.len - 1;
+    while (i > 0) {
+        const comb = s.compounds[i].combinator;
+        switch (comb) {
+            .child, .descendant => {
+                i -= 1;
+                for (s.compounds[i].simples) |x| switch (x) {
+                    .tag => |t| bloom |= perf.attrBit(t),
+                    .id => |id| bloom |= perf.attrBit(id),
+                    .class => |c| bloom |= perf.classBit(c),
+                    else => {},
+                };
+            },
+            .next, .later => i -= 1,
+        }
+    }
+    return bloom;
+}
+
+fn selectorSubjectAttrBloom(s: *const sel.Selector) u64 {
+    if (s.compounds.len == 0) return 0;
+    var bloom: u64 = 0;
+    for (s.compounds[s.compounds.len - 1].simples) |x| switch (x) {
+        .attr => |a| bloom |= perf.attrBit(a.lower),
+        else => {},
+    };
+    return bloom;
+}
+
 /// The rules of `items` that match `el`, as `collect` gives them.
 pub fn collectFrom(gpa: Allocator, items: []const Entry, el: *dom.Node, ctx: *match.Ctx, out: *List) Allocator.Error!void {
     try tryList(gpa, items, el, ctx, out);
 }
 
 fn tryList(gpa: Allocator, items: []const Entry, el: *dom.Node, ctx: *match.Ctx, out: *List) Allocator.Error!void {
+    const anc = ctx.ancestor_bloom;
+    const attrs = el.attr_filter;
     for (items) |e| {
+        if ((e.ancestor_bloom & anc) != e.ancestor_bloom or (e.attr_bloom & attrs) != e.attr_bloom) continue;
         if (match.matches(e.sel, el, ctx)) try out.append(gpa, e);
     }
 }

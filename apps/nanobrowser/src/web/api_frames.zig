@@ -96,12 +96,22 @@ pub fn carry(from: *World, to: *World, v: Value) Error!Value {
         if (r.id != window_export and r.peer == idOf(to.page)) return to.exports.items[r.id - 1];
     }
     if (obj == from.vm.global()) return windowProxy(to, from.page);
-    return makeProxy(to, idOf(from.page), try exported(from, obj), v.isCallable(), try @import("../js/b_array.zig").isArrayValue(from.vm, v));
+    const peer = idOf(from.page);
+    const id = try exported(from, obj);
+    const remote_key = (@as(u64, peer) << 32) | id;
+    if (to.import_by_remote.get(remote_key)) |p| return p.value();
+    return makeProxy(to, peer, id, v.isCallable(), try @import("../js/b_array.zig").isArrayValue(from.vm, v));
 }
 
 fn makeProxy(to: *World, peer: u32, id: u32, callable: bool, array: bool) Error!Value {
+    const remote_key = (@as(u64, peer) << 32) | id;
+    if (to.import_by_remote.get(remote_key)) |p| return p.value();
     const proxy = try to.vm.call(to.h.makeRemote, Value.undefined, &.{ Value.fromUsize(peer), Value.fromUsize(id), Value.fromBool(callable), Value.fromBool(array) });
-    if (proxy.isObject()) try to.imports.put(to.gpa, proxy.asObject(), .{ .peer = peer, .id = id });
+    if (proxy.isObject()) {
+        const pobj = proxy.asObject();
+        try to.imports.put(to.gpa, pobj, .{ .peer = peer, .id = id });
+        try to.import_by_remote.put(to.gpa, remote_key, pobj);
+    }
     return proxy;
 }
 
@@ -131,6 +141,75 @@ fn peerState(vm: *Vm, _: Value, args: []const Value) Error!Value {
     return Value.fromInt(if (frames.sameOrigin(bind.world(vm).page, p)) 1 else 2);
 }
 
+fn carryArgs(from: *World, to: *World, v: Value) Error!Value {
+    if (!v.isObject()) return (try to.vm.newArray(&.{})).value();
+    const arr = v.asObject();
+    const n: u32 = if (arr.isArray()) arr.arr_len else @intFromFloat(@max(0, try from.vm.toNumber(try arr.get(from.vm, "length"))));
+    const out = try to.vm.newArray(&.{});
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const item = try arr.getIdx(from.vm, i);
+        try out.setIdx(to.vm, i, try carry(from, to, item));
+    }
+    return out.value();
+}
+
+fn runRemoteOp(me: *World, o: *World, op_num: i32, object: Value, args: []const Value) Error!Value {
+    switch (op_num) {
+        0 => {
+            const key_arg = bind.arg(args, 3);
+            if (object.isObject()) {
+                if (key_arg.isInt() and key_arg.asInt() >= 0) {
+                    return object.asObject().getIdx(o.vm, @intCast(key_arg.asInt()));
+                }
+                if (key_arg.isString()) {
+                    return object.asObject().get(o.vm, try me.vm.toStringSlice(key_arg));
+                }
+            }
+        },
+        1 => {
+            const key_arg = bind.arg(args, 3);
+            if (object.isObject() and key_arg.isString()) {
+                try object.asObject().set(o.vm, try me.vm.toStringSlice(key_arg), try carry(me, o, bind.arg(args, 4)));
+                return Value.true;
+            }
+        },
+        6 => {
+            if (object.isCallable()) {
+                const this_arg = try carry(me, o, bind.arg(args, 3));
+                const raw_args = bind.arg(args, 4);
+                var stack_argv: [16]Value = undefined;
+                if (raw_args.isObject() and raw_args.asObject().isArray()) {
+                    const arr = raw_args.asObject();
+                    const n = arr.arr_len;
+                    if (n <= stack_argv.len) {
+                        for (0..n) |i| stack_argv[i] = try carry(me, o, try arr.getIdx(me.vm, @intCast(i)));
+                        return o.vm.call(object, this_arg, stack_argv[0..n]);
+                    }
+                }
+            }
+        },
+        7 => {
+            if (object.isConstructor()) {
+                const raw_args = bind.arg(args, 3);
+                var stack_argv: [16]Value = undefined;
+                if (raw_args.isObject() and raw_args.asObject().isArray()) {
+                    const arr = raw_args.asObject();
+                    const n = arr.arr_len;
+                    if (n <= stack_argv.len) {
+                        for (0..n) |i| stack_argv[i] = try carry(me, o, try arr.getIdx(me.vm, @intCast(i)));
+                        return o.vm.construct(object, stack_argv[0..n]);
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    const a = if (op_num == 7) try carryArgs(me, o, bind.arg(args, 3)) else try carry(me, o, bind.arg(args, 3));
+    const b = if (op_num == 6) try carryArgs(me, o, bind.arg(args, 4)) else try carry(me, o, bind.arg(args, 4));
+    return o.vm.call(o.h.remoteOp, Value.undefined, &.{ bind.arg(args, 0), object, a, b });
+}
+
 /// `$.remote(op, peer, id, a, b)`: the proxies' every operation.
 fn remote(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const me = bind.world(vm);
@@ -142,14 +221,12 @@ fn remote(vm: *Vm, _: Value, args: []const Value) Error!Value {
     const id: usize = @intCast(@max(0, bind.arg(args, 2).asInt()));
     if (id > o.exports.items.len) return Value.undefined;
     const object = if (id == window_export) o.vm.global().value() else o.exports.items[id - 1];
-    const a = try carry(me, o, bind.arg(args, 3));
-    const b = try carry(me, o, bind.arg(args, 4));
-    o.enter();
-    defer o.leave();
+    const op_num = if (bind.arg(args, 0).isInt()) bind.arg(args, 0).asInt() else -1;
     const was = o.caller;
     o.caller = me.page;
-    defer o.caller = was;
-    const out = o.vm.call(o.h.remoteOp, Value.undefined, &.{ bind.arg(args, 0), object, a, b }) catch |e| switch (e) {
+    o.enter();
+    defer o.leaveRemote(was);
+    const out = runRemoteOp(me, o, op_num, object, args) catch |e| switch (e) {
         error.Thrown => {
             const text = o.vm.exceptionString();
             const copy = try vm.newString(text);

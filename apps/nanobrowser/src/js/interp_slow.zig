@@ -132,6 +132,16 @@ pub fn exec(vm: *Vm, f: *Frame, op: Op) Error!void {
             vm.sp = sp - 1;
             f.pc = pc + 7;
         },
+        .get_env_check => {
+            var e = f.env.?;
+            var d = pc[1];
+            while (d != 0) : (d -= 1) e = e.parent.?;
+            const v = e.slots()[u16At(pc + 2)];
+            if (v.isHole()) return throwTdz(vm, f, u32At(pc + 4));
+            sp[0] = v;
+            vm.sp = sp + 1;
+            f.pc = pc + 8;
+        },
         .put_env_check => {
             var e = f.env.?;
             var d = pc[1];
@@ -195,6 +205,61 @@ pub fn exec(vm: *Vm, f: *Frame, op: Op) Error!void {
             sp[0] = (try objectops.argumentsObject(vm, f)).value();
             vm.sp = sp + 1;
             f.pc = pc + 1;
+        },
+        .args_get => {
+            const slot = u16At(pc + 1);
+            if (f.bp[slot].isHole()) f.bp[slot] = (try objectops.argumentsObject(vm, f)).value();
+            sp[0] = f.bp[slot];
+            vm.sp = sp + 1;
+            f.pc = pc + 3;
+        },
+        .args_len => {
+            const slot = u16At(pc + 1);
+            const cur = f.bp[slot];
+            sp[0] = if (cur.isHole()) Value.fromUsize(f.argc) else try props.getV(vm, cur, vm.k.length);
+            vm.sp = sp + 1;
+            f.pc = pc + 3;
+        },
+        .args_elem => {
+            const slot = u16At(pc + 1);
+            const idx = (sp - 1)[0];
+            if (f.bp[slot].isHole()) {
+                if (idx.isInt() and idx.asInt() >= 0) {
+                    const i: u32 = @intCast(idx.asInt());
+                    if (i < f.argc) {
+                        (sp - 1)[0] = f.args[i];
+                        f.pc = pc + 3;
+                        return;
+                    }
+                    if (!vm.protos.object.flags.proto_dirty) {
+                        (sp - 1)[0] = Value.undefined;
+                        f.pc = pc + 3;
+                        return;
+                    }
+                }
+                f.bp[slot] = (try objectops.argumentsObject(vm, f)).value();
+            }
+            (sp - 1)[0] = try icache.getElem(vm, f.bp[slot], idx);
+            f.pc = pc + 3;
+        },
+        .args_apply => {
+            const slot = u16At(pc + 1);
+            const recv = (sp - 3)[0];
+            const fn_val = (sp - 2)[0];
+            const this_arg = (sp - 1)[0];
+            f.pc = pc + 3;
+            if (f.bp[slot].isHole() and fn_val.isObject() and fn_val.asObject().class == .native and fn_val.asObject().payload.native.func == &@import("b_function.zig").fnApply) {
+                vm.sp = sp - 3;
+                const r = try calls.call(vm, recv, this_arg, f.args[0..f.argc]);
+                (sp - 3)[0] = r;
+                vm.sp = sp - 2;
+                return;
+            }
+            if (f.bp[slot].isHole()) f.bp[slot] = (try objectops.argumentsObject(vm, f)).value();
+            vm.sp = sp - 3;
+            const r = try calls.call(vm, fn_val, recv, &.{ this_arg, f.bp[slot] });
+            (sp - 3)[0] = r;
+            vm.sp = sp - 2;
         },
         .rest => {
             const first = u16At(pc + 1);
@@ -379,8 +444,25 @@ pub fn exec(vm: *Vm, f: *Frame, op: Op) Error!void {
         .in_ => {
             const r = (sp - 1)[0];
             if (!r.isObject()) return vm.throwError(.TypeError, "Cannot use 'in' operator on a non-object");
-            const key = try conv.toPropKey(vm, (sp - 2)[0]);
-            (sp - 2)[0] = Value.fromBool(try props.has(vm, r.asObject(), key));
+            const k = (sp - 2)[0];
+            const ro = r.asObject();
+            if (k.isString()) {
+                const s = k.asString();
+                if (try str.findExistingKey(vm, s)) |ek| {
+                    (sp - 2)[0] = Value.fromBool(try props.has(vm, ro, ek));
+                    vm.sp = sp - 1;
+                    f.pc = pc + 1;
+                    return;
+                }
+                if (icache.noExoticOnChain(ro)) {
+                    (sp - 2)[0] = Value.false;
+                    vm.sp = sp - 1;
+                    f.pc = pc + 1;
+                    return;
+                }
+            }
+            const key = try conv.toPropKey(vm, k);
+            (sp - 2)[0] = Value.fromBool(try props.has(vm, ro, key));
             vm.sp = sp - 1;
             f.pc = pc + 1;
         },
@@ -437,6 +519,41 @@ pub fn exec(vm: *Vm, f: *Frame, op: Op) Error!void {
         .to_object => {
             (sp - 1)[0] = (try conv.toObject(vm, (sp - 1)[0])).value();
             f.pc = pc + 1;
+        },
+        .new_object => {
+            sp[0] = (try objmod.newPlain(vm)).value();
+            vm.sp = sp + 1;
+            f.pc = pc + 1;
+        },
+        .define_field => {
+            const ic = &f.fp.ics[u32At(pc + 1)];
+            const o = (sp - 2)[0].asObject();
+            const v = (sp - 1)[0];
+            if (o.shape == ic.shape and ic.is_transition and ic.slot < o.slot_cap and !o.flags.is_proto) {
+                o.shape = ic.holder_shape.?;
+                o.slots[ic.slot] = v;
+            } else {
+                try icache.defineField(vm, ic, o, v);
+            }
+            vm.sp = sp - 1;
+            f.pc = pc + 5;
+        },
+        .array_from => {
+            const n = u32At(pc + 1);
+            const arr = try objmod.newArray(vm, (sp - n)[0..n]);
+            (sp - n)[0] = arr.value();
+            vm.sp = sp - n + 1;
+            f.pc = pc + 5;
+        },
+        .array_append => {
+            try objmod.arrayPush(vm, (sp - 2)[0].asObject(), (sp - 1)[0]);
+            vm.sp = sp - 1;
+            f.pc = pc + 1;
+        },
+        .closure => {
+            sp[0] = (try objectops.makeClosure(vm, f.fp.protos[u32At(pc + 1)], f.env)).value();
+            vm.sp = sp + 1;
+            f.pc = pc + 5;
         },
         .with_get, .with_get_call, .with_put, .with_delete => try execWith(vm, f, op),
         .nop => f.pc = pc + 1,

@@ -19,6 +19,7 @@ pub const Ctx = struct {
     /// keeps a restyle of a long list from being quadratic.
     nth_node: ?*const Node = null,
     nth_index: i32 = 0,
+    ancestor_bloom: u64 = std.math.maxInt(u64),
 };
 
 pub fn matches(s: *const Selector, el: *Node, ctx: *Ctx) bool {
@@ -100,8 +101,9 @@ pub fn compound(c: *const Compound, el: *Node, ctx: *Ctx) bool {
     return true;
 }
 
-fn tagMatches(want: []const u8, el: *const Node) bool {
-    if (el.ns == .html) return std.mem.eql(u8, want, el.tag);
+inline fn tagMatches(want: []const u8, el: *const Node) bool {
+    if (want.len != el.tag.len) return false;
+    if (el.ns == .html) return want.len == 0 or (want[0] == el.tag[0] and std.mem.eql(u8, want, el.tag));
     return std.ascii.eqlIgnoreCase(want, el.tag);
 }
 
@@ -161,11 +163,15 @@ const ci_attrs = std.StaticStringMap(void).initComptime(.{
     .{"type"},       .{"valign"},         .{"valuetype"}, .{"vlink"},
 });
 
+pub fn isCiHtmlAttr(lower_name: []const u8) bool {
+    return ci_attrs.has(lower_name);
+}
+
 fn attrMatches(a: *const sel.Attr, el: *const Node) bool {
     const is_html = el.ns == .html;
     const v = el.attr(if (is_html) a.lower else a.name) orelse return false;
     if (a.op == .exists) return true;
-    const ci = a.ci orelse (is_html and ci_attrs.has(a.lower));
+    const ci = a.ci orelse (is_html and a.ci_html);
     const want = a.value;
     return switch (a.op) {
         .exists => true,

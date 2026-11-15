@@ -21,6 +21,8 @@ pub const Symbol = struct {
     is_registered: bool = false,
 };
 
+pub const inline_bytes = 24;
+
 pub const JSString = struct {
     cell: Cell,
     is_ascii: bool,
@@ -37,6 +39,7 @@ pub const JSString = struct {
     u16s: ?[*]u16 = null,
     /// The cached property key for this string; zero until first used as a key.
     key: PropKey = PropKey.none,
+    inline_buf: [inline_bytes]u8 = undefined,
 
     pub fn finalize(s: *JSString, gpa: Allocator) void {
         if (s.owns) gpa.free(@constCast(s.ptr[0..s.byte_len]));
@@ -57,6 +60,14 @@ pub const JSString = struct {
         var n: usize = 0;
         var i: usize = 0;
         while (i < b.len) {
+            while (i + 8 <= b.len) {
+                const w = @as(*align(1) const u64, @ptrCast(b.ptr + i)).*;
+                if ((w & 0x8080808080808080) != 0) break;
+                inline for (0..8) |k| out[n + k] = b[i + k];
+                i += 8;
+                n += 8;
+            }
+            if (i >= b.len) break;
             const d = decode(b, i);
             i += d.len;
             if (d.cp >= 0x10000) {
@@ -124,14 +135,24 @@ pub fn encode(cp: u32, out: []u8) usize {
     return 4;
 }
 
+/// Theorem 60 (`NanoUI.Speedometer3Climb.ascii_string_scan_and_char_keyword_atom_equiv`):
+/// Scans 8 bytes at a time for high bits (`0x8080808080808080`) and short-circuits `scan`.
 fn isAscii(b: []const u8) bool {
-    for (b) |c| if (c >= 0x80) return false;
+    var i: usize = 0;
+    while (i + 8 <= b.len) : (i += 8) {
+        const w = @as(*align(1) const u64, @ptrCast(b.ptr + i)).*;
+        if ((w & 0x8080808080808080) != 0) return false;
+    }
+    while (i < b.len) : (i += 1) {
+        if (b[i] >= 0x80) return false;
+    }
     return true;
 }
 
 const Scan = struct { len16: usize, has_lone: bool, valid: bool };
 
 fn scan(b: []const u8) Scan {
+    if (isAscii(b)) return .{ .len16 = b.len, .has_lone = false, .valid = true };
     var r = Scan{ .len16 = 0, .has_lone = false, .valid = true };
     var i: usize = 0;
     while (i < b.len) {
@@ -190,8 +211,15 @@ pub fn fromUtf8(vm: *Vm, bytes: []const u8) Error!*JSString {
     if (bytes.len == 1 and bytes[0] < 0x80) return vm.char_strs[bytes[0]];
     const r = scan(bytes);
     if (r.valid) {
-        const copy = try vm.gpa.dupe(u8, bytes);
         const ascii = r.len16 == bytes.len;
+        if (bytes.len <= inline_bytes) {
+            const s = try alloc(vm, ascii, undefined, bytes.len, r.len16);
+            @memcpy(s.inline_buf[0..bytes.len], bytes);
+            s.ptr = &s.inline_buf;
+            s.has_lone = r.has_lone;
+            return s;
+        }
+        const copy = try vm.gpa.dupe(u8, bytes);
         const s = try alloc(vm, ascii, copy.ptr, copy.len, r.len16);
         s.owns = true;
         s.has_lone = r.has_lone;
@@ -210,10 +238,35 @@ pub fn fromUtf8(vm: *Vm, bytes: []const u8) Error!*JSString {
     return adopt(vm, try out.toOwnedSlice(vm.gpa));
 }
 
+fn isAscii16(u: []const u16) bool {
+    var i: usize = 0;
+    while (i + 4 <= u.len) : (i += 4) {
+        const w = @as(*align(1) const u64, @ptrCast(u.ptr + i)).*;
+        if ((w & 0xFF80_FF80_FF80_FF80) != 0) return false;
+    }
+    while (i < u.len) : (i += 1) {
+        if (u[i] >= 0x80) return false;
+    }
+    return true;
+}
+
 /// A string from UTF-16 code units; surrogate pairs merge, lone ones stay as WTF-8.
 pub fn fromUtf16(vm: *Vm, u: []const u16) Error!*JSString {
     if (u.len == 0) return vm.empty;
     if (u.len == 1 and u[0] < 0x80) return vm.char_strs[u[0]];
+    if (isAscii16(u)) {
+        if (u.len <= inline_bytes) {
+            const s = try alloc(vm, true, undefined, u.len, u.len);
+            for (u, 0..) |c, k| s.inline_buf[k] = @intCast(c);
+            s.ptr = &s.inline_buf;
+            return s;
+        }
+        const buf = try vm.gpa.alloc(u8, u.len);
+        for (u, buf) |c, *dst| dst.* = @intCast(c);
+        const s = try alloc(vm, true, buf.ptr, u.len, u.len);
+        s.owns = true;
+        return s;
+    }
     var size: usize = 0;
     var i: usize = 0;
     var lone = false;
@@ -230,6 +283,22 @@ pub fn fromUtf16(vm: *Vm, u: []const u16) Error!*JSString {
             if (c >= 0xD800 and c < 0xE000) lone = true;
             size += 3;
         }
+    }
+    if (size <= inline_bytes) {
+        const s = try alloc(vm, size == u.len, undefined, size, u.len);
+        var n: usize = 0;
+        i = 0;
+        while (i < u.len) : (i += 1) {
+            var cp: u32 = u[i];
+            if (cp >= 0xD800 and cp < 0xDC00 and i + 1 < u.len and u[i + 1] >= 0xDC00 and u[i + 1] < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (u[i + 1] - 0xDC00);
+                i += 1;
+            }
+            n += encode(cp, s.inline_buf[n..]);
+        }
+        s.ptr = &s.inline_buf;
+        s.has_lone = lone;
+        return s;
     }
     const buf = try vm.gpa.alloc(u8, size);
     var n: usize = 0;
@@ -250,17 +319,30 @@ pub fn fromUtf16(vm: *Vm, u: []const u16) Error!*JSString {
 
 /// The interned string with these bytes.
 pub fn intern(vm: *Vm, bytes: []const u8) Error!*JSString {
+    if (bytes.len == 0) return vm.empty;
+    if (bytes.len == 1 and bytes[0] < 0x80) return vm.char_strs[bytes[0]];
     if (vm.atoms.get(bytes)) |a| return a;
     const r = scan(bytes);
     if (!r.valid) {
         const s = try fromUtf8(vm, bytes);
         return internString(vm, s);
     }
+    if (bytes.len <= inline_bytes) {
+        const s = try alloc(vm, r.len16 == bytes.len, undefined, bytes.len, r.len16);
+        @memcpy(s.inline_buf[0..bytes.len], bytes);
+        s.ptr = &s.inline_buf;
+        s.has_lone = r.has_lone;
+        s.is_atom = true;
+        s.key = if (parseIndex(bytes)) |idx| PropKey.fromIndex(idx) else PropKey.fromAtom(s);
+        try vm.atoms.put(vm.gpa, s.inline_buf[0..bytes.len], s);
+        return s;
+    }
     const copy = try vm.gpa.dupe(u8, bytes);
     const s = try alloc(vm, r.len16 == bytes.len, copy.ptr, copy.len, r.len16);
     s.owns = copy.len != 0;
     s.has_lone = r.has_lone;
     s.is_atom = true;
+    s.key = if (parseIndex(copy)) |idx| PropKey.fromIndex(idx) else PropKey.fromAtom(s);
     try vm.atoms.put(vm.gpa, copy, s);
     return s;
 }
@@ -271,8 +353,26 @@ pub fn internString(vm: *Vm, s: *JSString) Error!*JSString {
     const b = try s.flat(vm);
     if (vm.atoms.get(b)) |a| return a;
     s.is_atom = true;
+    s.key = if (parseIndex(b)) |idx| PropKey.fromIndex(idx) else PropKey.fromAtom(s);
     try vm.atoms.put(vm.gpa, b, s);
     return s;
+}
+
+/// Returns an existing canonical index or interned atom key without interning `s` on a miss.
+pub fn findExistingKey(vm: *Vm, s: *JSString) Error!?PropKey {
+    if (s.key.bits != 0) return s.key;
+    const b = try s.flat(vm);
+    if (b.len == 0) return vm.empty.key;
+    if (b.len == 1 and b[0] < 0x80) return vm.char_strs[b[0]].key;
+    if (parseIndex(b)) |i| {
+        s.key = PropKey.fromIndex(i);
+        return s.key;
+    }
+    if (vm.atoms.get(b)) |a| {
+        s.key = PropKey.fromAtom(a);
+        return s.key;
+    }
+    return null;
 }
 
 /// The property key for a string: a canonical array index, or its atom.
@@ -324,12 +424,11 @@ pub fn concat(vm: *Vm, a: *JSString, b: *JSString) Error!*JSString {
     }
     const ascii = a.is_ascii and b.is_ascii;
     const len16: usize = @as(usize, a.len16) + b.len16;
-    if (total < 24 and !a.is_rope and !b.is_rope) {
-        const buf = try vm.gpa.alloc(u8, total);
-        @memcpy(buf[0..a.byte_len], a.ptr[0..a.byte_len]);
-        @memcpy(buf[a.byte_len..], b.ptr[0..b.byte_len]);
-        const s = try alloc(vm, ascii, buf.ptr, total, len16);
-        s.owns = true;
+    if (total <= inline_bytes and !a.is_rope and !b.is_rope) {
+        const s = try alloc(vm, ascii, undefined, total, len16);
+        @memcpy(s.inline_buf[0..a.byte_len], a.ptr[0..a.byte_len]);
+        @memcpy(s.inline_buf[a.byte_len..][0..b.byte_len], b.ptr[0..b.byte_len]);
+        s.ptr = &s.inline_buf;
         s.has_lone = a.has_lone or b.has_lone;
         return s;
     }
@@ -383,6 +482,7 @@ pub fn eql(vm: *Vm, a: *JSString, b: *JSString) Error!bool {
     if (a == b) return true;
     if (a.byte_len != b.byte_len or a.len16 != b.len16) return false;
     if (a.is_atom and b.is_atom) return false;
+    if (a.key.bits != 0 and b.key.bits != 0) return a.key.bits == b.key.bits;
     return std.mem.eql(u8, try a.flat(vm), try b.flat(vm));
 }
 
@@ -471,6 +571,14 @@ pub const Builder = struct {
     }
     pub fn str(b: *Builder, s: *JSString) Error!void {
         try b.bytes(try s.flat(b.vm));
+    }
+    pub fn sub(b: *Builder, s: *JSString, start: usize, end: usize) Error!void {
+        if (start >= end) return;
+        if (s.is_ascii) {
+            try b.bytes((try s.flat(b.vm))[start..end]);
+        } else {
+            try b.str(try substring(b.vm, s, start, end));
+        }
     }
     pub fn cp(b: *Builder, c: u32) Error!void {
         var t: [4]u8 = undefined;

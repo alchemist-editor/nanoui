@@ -28,6 +28,10 @@ pub const Op = enum(u8) {
     new_target,
     home,
     arguments,
+    args_get, // u16 slot
+    args_len, // u16 slot
+    args_elem, // u16 slot (idx -> val)
+    args_apply, // u16 slot (recv fn thisArg -> ret)
     rest, // u16 first index
     // stack shuffles
     pop,
@@ -201,14 +205,40 @@ pub const Op = enum(u8) {
 };
 
 pub const IC = struct {
+    pub const missing_slot: u32 = std.math.maxInt(u32);
+    pub const proto_poly_cap = 16;
+    pub const own_poly_cap = 4;
+
+    pub inline fn protoHashBase(sh: *const Shape) usize {
+        const p = @intFromPtr(sh);
+        const x = p ^ (p >> 3);
+        return ((x >> 4) & 7) << 1;
+    }
+
     key: PropKey,
     shape: ?*Shape = null,
     holder: ?*Object = null,
     holder_shape: ?*Shape = null,
     slot: u32 = 0,
+    epoch: u32 = 0,
+    is_accessor: bool = false,
+    is_transition: bool = false,
+    is_str_len: bool = false,
+    fast_own_data: bool = false,
+    fast_proto_data: bool = false,
+    proto_idx: u8 = 0,
+    own_idx: u8 = 0,
+    own_slots: [own_poly_cap]u32 = @splat(0),
+    own_shapes: [own_poly_cap]?*Shape = @splat(null),
+    proto_shapes: [proto_poly_cap]?*Shape = @splat(null),
 };
 
 pub const LineEntry = struct { pc: u32, pos: u32 };
+pub const CatchEntry = struct { bc_pc: u32, word_off: u32 };
+pub const JitCacheSlot = struct {
+    jit_fn: ?*const anyopaque = null,
+    catch_map: []CatchEntry = &.{},
+};
 
 pub const Source = struct {
     cell: heap.Cell,
@@ -216,9 +246,10 @@ pub const Source = struct {
     name: []u8,
     /// Offsets of line starts, built the first time a position is reported.
     line_starts: []u32 = &.{},
+    borrowed_text: bool = false,
 
     pub fn finalize(s: *Source, gpa: Allocator) void {
-        gpa.free(s.text);
+        if (!s.borrowed_text) gpa.free(s.text);
         gpa.free(s.name);
         gpa.free(s.line_starts);
     }
@@ -268,6 +299,7 @@ pub const FuncProto = struct {
     nparams: u16,
     nlocals: u32,
     max_stack: u32,
+    stack_need_bytes: u32 = 0,
     strict: bool,
     is_arrow: bool,
     is_async: bool,
@@ -279,29 +311,86 @@ pub const FuncProto = struct {
     coerce_this: bool,
     needs_home: bool,
     is_method: bool,
+    needs_args: bool = false,
+    has_loop: bool = false,
+    borrowed_code: bool = false,
     module: ?*module.Module = null,
+    jit_fn: ?*const anyopaque = null,
+    jit_fast_fn: ?*const anyopaque = null,
+    catch_map: []CatchEntry = &.{},
+    jit_cache_slot: ?*JitCacheSlot = null,
+    hot_count: u16 = 0,
+    jit_disabled: bool = false,
+
+    pub const fast_entry_words = 24;
+
+    pub inline fn findCatchWord(p: *const FuncProto, bc_pc: u32) ?u32 {
+        for (p.catch_map) |ce| {
+            if (ce.bc_pc == bc_pc) return ce.word_off;
+        }
+        return null;
+    }
+
+    pub inline fn setJitFn(p: *FuncProto, jfn: ?*const anyopaque) void {
+        p.jit_fn = jfn;
+        p.jit_fast_fn = if (jfn != null and !p.is_class_ctor and p.nlocals <= 256)
+            @ptrFromInt(@intFromPtr(jfn.?) + fast_entry_words * @sizeOf(u32))
+        else
+            null;
+    }
 
     pub fn trace(p: *FuncProto, m: *heap.Marker) void {
         m.markValues(p.constants);
         for (p.protos) |c| m.markCell(&c.cell);
-        for (p.ics) |*ic| {
-            m.markKey(ic.key);
-            // Caches are weak; a collection simply starts them cold.
-            ic.shape = null;
-            ic.holder = null;
-            ic.holder_shape = null;
-        }
+        for (p.ics) |*ic| m.markKey(ic.key);
+        if (p.ics.len != 0) m.protos.append(m.vm.raw_gpa, p) catch @panic("gc: out of memory");
         m.markStr(p.name);
         m.markCell(&p.source.cell);
         if (p.module) |mo| m.markCell(&mo.cell);
     }
 
+    /// Theorem 51 (`NanoUI.Speedometer3Climb.single_pass_gc_sweep_and_warm_ic_sound`):
+    /// Preserves warm inline caches across GC when their referenced cells remain live.
+    pub fn sweepICs(p: *FuncProto) void {
+        for (p.ics) |*ic| {
+            const dead = (if (ic.shape) |s| !s.cell.marked else false) or
+                (if (ic.holder) |h| !h.cell.marked else false) or
+                (if (ic.holder_shape) |hs| !hs.cell.marked else false);
+            if (dead) {
+                ic.shape = null;
+                ic.holder = null;
+                ic.holder_shape = null;
+                ic.epoch = 0;
+                ic.is_accessor = false;
+                ic.is_transition = false;
+                ic.fast_own_data = false;
+                ic.fast_proto_data = false;
+                ic.proto_idx = 0;
+                ic.proto_shapes = @splat(null);
+            } else {
+                for (&ic.proto_shapes) |*ps| {
+                    if (ps.*) |s| if (!s.cell.marked) {
+                        ps.* = null;
+                    };
+                }
+            }
+            for (&ic.own_shapes) |*os| {
+                if (os.*) |s| if (!s.cell.marked) {
+                    os.* = null;
+                };
+            }
+        }
+    }
+
     pub fn finalize(p: *FuncProto, gpa: Allocator) void {
-        gpa.free(p.code);
+        if (!p.borrowed_code) {
+            gpa.free(p.code);
+            gpa.free(p.lines);
+            if (p.catch_map.len > 0) gpa.free(p.catch_map);
+        }
         gpa.free(p.constants);
         gpa.free(p.protos);
         gpa.free(p.ics);
-        gpa.free(p.lines);
     }
 
     /// The source position of the instruction at or before pc.
@@ -319,7 +408,8 @@ pub const FuncProto = struct {
 /// The net stack effect of opcodes with a fixed one.
 pub fn effect(op: Op) i32 {
     return switch (op) {
-        .undef, .null_, .true_, .false_, .hole, .int8, .int32, .constant, .this, .callee, .new_target, .home, .arguments, .rest => 1,
+        .undef, .null_, .true_, .false_, .hole, .int8, .int32, .constant, .this, .callee, .new_target, .home, .arguments, .args_get, .args_len, .rest => 1,
+        .args_elem => 0,
         .pop => -1,
         .dup => 1,
         .dup2 => 2,
@@ -353,7 +443,7 @@ pub fn effect(op: Op) i32 {
         .neg, .plus, .not, .bit_not, .inc, .dec, .typeof_, .to_numeric, .to_propkey, .to_str => 0,
         .jump, .loop, .opt_chain => 0,
         .jump_false, .jump_true, .jump_false_keep, .jump_true_keep, .jump_notnull_keep, .jump_not_undef => -1,
-        .apply, .apply_new, .super_apply => -2,
+        .apply, .apply_new, .super_apply, .args_apply => -2,
         .get_super_ctor, .check_coercible, .nop => 0,
         .super_forward => 1,
         .check_super_once => -1,
@@ -370,7 +460,7 @@ pub fn effect(op: Op) i32 {
         .iter_close, .iter_drop => -3,
         .async_iter_close => -2,
         .iter_result => 0,
-        .for_in_start => 0,
+        .for_in_start => 1,
         .for_in_next => 1,
         .async_start, .initial_yield => 0,
         .yield_, .yield_raw, .await_ => 1,

@@ -20,16 +20,15 @@ pub const WM_NANOUI_CONTROLLER: u32 = w.WM_APP + 0x4001;
 pub const WM_NANOUI_JOB: u32 = w.WM_APP + 0x4002;
 
 /// Asks the window to run `page`'s queued messages once the loop turns.
-/// The page rides in wParam: a window holds its own page and the ones
-/// docked in it, and the message must reach the one that asked (a page
-/// gone by then is not found, and the message is dropped).
-pub fn postFlush(hwnd: w.HWND, page: *Page) void {
-    _ = w.PostMessageW(hwnd, WM_NANOUI_FLUSH, @intFromPtr(page), 0);
+/// A non-reused id rides in wParam, not a pointer: late messages cannot
+/// reach a replacement page that happens to reuse the old allocation.
+pub fn postFlush(page: *Page) void {
+    @import("../page_webview2_target.zig").post(page, WM_NANOUI_FLUSH, w.PostMessageW);
 }
 
 /// Asks the window to make `page`'s controller on the loop's next turn.
-pub fn postController(hwnd: w.HWND, page: *Page) void {
-    _ = w.PostMessageW(hwnd, WM_NANOUI_CONTROLLER, @intFromPtr(page), 0);
+pub fn postController(page: *Page) void {
+    @import("../page_webview2_target.zig").post(page, WM_NANOUI_CONTROLLER, w.PostMessageW);
 }
 const ui = @import("../ui/ui.zig");
 
@@ -131,6 +130,9 @@ pub const Window = struct {
         var ex: u32 = 0;
         if (options.skip_taskbar) ex |= w.WS_EX_TOOLWINDOW;
         if (options.opacity < 1 or self.transparent) ex |= w.WS_EX_LAYERED;
+        // Topmost at birth: asking for it later (`SetWindowPos`) is demoted
+        // for a background process, a style it was created with never is.
+        if (options.always_on_top) ex |= w.WS_EX_TOPMOST;
         const hwnd = w.CreateWindowExW(ex, class_name, w.wide(&title, options.title), style, w.CW_USEDEFAULT, w.CW_USEDEFAULT, 100, 100, null, null, inst, null) orelse return error.CreateWindow;
         self.hwnd = hwnd;
         // The title bar matches the theme before the window is first shown; a
@@ -309,10 +311,10 @@ pub const Window = struct {
 
     /// The page a posted message names (`postFlush`): the window's own or
     /// a docked one, if it is still there.
-    fn pageFor(self: *Window, wp: w.WPARAM) ?*Page {
-        if (wp == 0) return self.page;
-        if (self.page) |p| if (@intFromPtr(p) == wp) return p;
-        for (self.docked.items) |p| if (@intFromPtr(p) == wp) return p;
+    pub fn pageFor(self: *Window, wp: w.WPARAM) ?*Page {
+        if (self.closed or wp == 0) return null;
+        if (self.page) |p| if (p.target.id == wp and !p.queue.dead) return p;
+        for (self.docked.items) |p| if (p.target.id == wp and !p.queue.dead) return p;
         return null;
     }
 
@@ -439,6 +441,17 @@ pub const Window = struct {
         const h = self.hwnd orelse return;
         const topmost: isize = if (on) -1 else -2;
         _ = w.SetWindowPos(h, @ptrFromInt(@as(usize, @bitCast(topmost))), 0, 0, 0, 0, 0x0001 | 0x0002);
+        // The call only *asks*: Windows demotes a background process — it
+        // succeeds, the window goes as high as it may, and the style stays as
+        // it was. The style itself is set directly: a style change is not a
+        // z-order change, so it is never demoted.
+        const ex = w.GetWindowLongPtrW(h, w.GWL_EXSTYLE);
+        const has = ex & w.WS_EX_TOPMOST != 0;
+        if (has == on) return;
+        const next = if (on) ex | w.WS_EX_TOPMOST else ex & ~@as(isize, w.WS_EX_TOPMOST);
+        _ = w.SetWindowLongPtrW(h, w.GWL_EXSTYLE, next);
+        // A frame changed, nothing moved or reordered: the style above takes.
+        _ = w.SetWindowPos(h, null, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020);
     }
 
     pub fn isFullScreen(self: *Window) bool {

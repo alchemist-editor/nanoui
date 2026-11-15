@@ -17,6 +17,7 @@ const frame_mod = @import("../ui/frame.zig");
 const ctx_mod = @import("../ui/context.zig");
 const clock = @import("../ui/clock.zig");
 const Theme = @import("../ui/theme.zig").Theme;
+const sameChoice = @import("../ui/theme.zig").sameChoice;
 const Context = ctx_mod.Context;
 const Window = @import("window.zig").Window;
 const d3d = @import("d3d.zig");
@@ -270,13 +271,6 @@ pub const Surface = struct {
         self.trace("built: {d:.0}x{d:.0} scale {d:.2}, {d} draws, anim={} hot={} in={?d:.2} ticking={}", .{ self.size.w, self.size.h, self.scale, self.instances.items.len, c.animating, r.hot_changed, c.frame_in, self.ticking });
     }
 
-    /// Whether two theme choices pick the same theme (both null: the system's).
-    fn sameChoice(a: ?Theme, b: ?Theme) bool {
-        const an = a orelse return b == null;
-        const bn = b orelse return false;
-        return std.meta.eql(an, bn);
-    }
-
     /// The frame log, recording from now on (`NANOUI_FRAMES` opens one
     /// that writes a file).
     pub fn recordFrames(self: *Surface, gpa: std.mem.Allocator) !*frame_log.FrameLog {
@@ -462,7 +456,8 @@ pub const Surface = struct {
                 }
             },
             // The buttons, and the capture lost mid-press: `surface_win_mouse.zig`.
-            w.WM_LBUTTONDOWN, w.WM_LBUTTONDBLCLK, w.WM_LBUTTONUP, w.WM_MBUTTONDOWN, w.WM_MBUTTONDBLCLK, w.WM_MBUTTONUP, w.WM_CAPTURECHANGED => return mouse.message(self, h, msg, wp, lp),
+            w.WM_LBUTTONDOWN, w.WM_LBUTTONDBLCLK, w.WM_LBUTTONUP, w.WM_RBUTTONDOWN, w.WM_RBUTTONDBLCLK, w.WM_RBUTTONUP => return mouse.message(self, h, msg, wp, lp),
+            w.WM_MBUTTONDOWN, w.WM_MBUTTONDBLCLK, w.WM_MBUTTONUP, w.WM_CAPTURECHANGED => return mouse.message(self, h, msg, wp, lp),
             w.WM_MOUSEWHEEL => {
                 var p: w.POINT = .{ .x = @as(i16, @truncate(lp)), .y = @as(i16, @truncate(lp >> 16)) };
                 _ = w.ScreenToClient(h, &p);

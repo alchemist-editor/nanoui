@@ -59,6 +59,7 @@ const Gallery = struct {
     motion: @import("motion.zig").Demo = .{},
     kit: @import("kit.zig").Demo = .{},
     glass: @import("glass.zig").Demo = .{},
+    typography: @import("typography.zig").Demo = .{},
     /// The app, so a page can make a window of its own: the Windows page does,
     /// because a borderless or translucent window is the only way to see what
     /// those options do.
@@ -119,38 +120,47 @@ const Gallery = struct {
         switch (g.page) {
             0 => g.controls(c),
             1 => g.tasks(c),
-            2 => g.typography(c),
+            2 => g.typography.view(c),
             else => g.bigList(c),
         }
     }
 
     fn sidebar(g: *Gallery, c: *ui.Context) void {
         const th = c.theme;
+        c.title_bar_height = 40;
         ui.column(c, .{
             .width = .{ .px = 200 },
             .height = .fill,
             .padding = .{ .top = 44, .left = 12, .right = 12, .bottom = 12 },
             .gap = 4,
+            .clip = true,
             .background = th.surface.alpha(0.6),
             .border = th.border,
             .border_width = 0,
         });
         defer ui.end(c);
-        ui.text(c, "nanoui", .{ .size = 18, .weight = .bold });
-        ui.label(c, c.print("Zig 0.17 · {s}", .{c.renderer}));
-        _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
-        for (phone.pages, 0..) |p, i| {
-            const selected = g.page == i;
-            // GPUI's way: a box styled by a chain of methods.
-            var item = ui.div(c).row().wFull().px(10).py(7).gap(8).itemsCenter().rounded(7);
-            item = if (selected) item.bg(th.accent) else item.hover(th.surface_hover);
-            defer item.end();
-            if (item.clicked()) g.page = i;
-            const fg = if (selected) th.accent_text else th.text;
-            ui.icon(c, p[1], .{ .size = 14, .frame = 18, .color = fg });
-            ui.text(c, p[0], .{ .weight = .medium, .color = fg });
+        {
+            const head = ui.div(c).column().px(2).gap(4);
+            defer head.end();
+            ui.text(c, "nanoui", .{ .size = 18, .weight = .bold });
+            ui.label(c, c.print("Zig 0.17 · {s}", .{c.renderer}));
         }
-        ui.spacer(c);
+        _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
+        {
+            const nav = ui.div(c).column().wFull().grow().gap(4).scrollY().scrollEdgeFade(12).scrollBarIdle(3.0);
+            defer nav.end();
+            for (phone.pages, 0..) |p, i| {
+                const selected = g.page == i;
+                // GPUI's way: a box styled by a chain of methods.
+                var item = ui.div(c).row().wFull().px(10).py(7).gap(8).itemsCenter().rounded(7);
+                item = if (selected) item.bg(th.accent) else item.hover(th.surface_hover);
+                defer item.end();
+                if (item.clicked()) g.page = i;
+                const fg = if (selected) th.accent_text else th.text;
+                ui.icon(c, p[1], .{ .size = 14, .frame = 18, .color = fg });
+                ui.text(c, p[0], .{ .weight = .medium, .color = fg });
+            }
+        }
         ui.label(c, c.print("{d} frames", .{c.frame}));
         ui.label(c, c.print("{d:.0} fps", .{g.fps}));
     }
@@ -493,6 +503,7 @@ const Gallery = struct {
     /// `window_drag` handle — only when borderless, because a decorated window
     /// already moves by its own title bar and would be moved twice.
     fn demoView(g: *Gallery, c: *ui.Context) void {
+        if (!g.demo_borderless) c.title_bar_height = 38;
         ui.column(c, .{ .padding = .all(16), .gap = 10, .width = .fill, .height = .fill });
         defer ui.end(c);
         const drag = ui.div(c).row().wFull().itemsCenter().h(24);
@@ -507,22 +518,6 @@ const Gallery = struct {
         ui.text(c, if (g.demo_borderless) "borderless: no title bar, no frame." else "decorated: drag the title bar.", .{});
         ui.text(c, if (g.demo_skip_taskbar) "Out of the taskbar and Alt-Tab." else "In the taskbar and Alt-Tab.", .{});
         ui.textf(c, .{ .color = c.theme.muted }, "opacity {d:.0}%", .{g.demo_opacity * 100});
-    }
-
-    fn typography(_: *Gallery, c: *ui.Context) void {
-        ui.heading(c, "Typography");
-        ui.card(c, .{ .width = .fill, .gap = 10, .max_width = 640, .selectable = true });
-        defer ui.end(c);
-        ui.text(c, "Large Title", .{ .size = 30, .weight = .bold });
-        ui.text(c, "Title, semibold", .{ .size = 20, .weight = .semibold });
-        ui.text(c, "Body text in the system font, at 14 points.", .{});
-        ui.text(c, "const mono = \"monospaced, for code\";", .{ .mono = true, .size = 13 });
-        ui.text(c, "Unicode: naïve café — 日本語 — Ελληνικά — ✓ ★ →", .{});
-        ui.divider(c);
-        ui.text(c, "Text wraps to the width its box gets. Resize the window to watch these lines break " ++
-            "again: layout runs every frame, measured with CoreText, and each line is rasterized once into a " ++
-            "glyph atlas at the display's scale, then drawn as textured quads by one instanced Metal draw " ++
-            "call together with every rectangle, border and shadow on screen.", .{ .wrap = true, .color = c.theme.muted });
     }
 };
 

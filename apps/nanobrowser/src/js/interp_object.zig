@@ -33,16 +33,24 @@ inline fn u32At(p: [*]const u8) u32 {
 }
 
 pub fn argumentsObject(vm: *Vm, f: *Frame) Error!*Object {
-    const a = try objmod.create(vm, vm.protos.object, .arguments);
+    const sh = if (f.fp.strict) vm.args_strict_shape else vm.args_sloppy_shape;
+    const a = try objmod.alloc(vm, sh, .arguments);
     const n = f.argc;
     if (n != 0) {
-        try objmod.growElems(vm, a, n);
+        if (n <= objmod.inline_slots - 3) {
+            a.slot_cap = 3;
+            a.elems = @as([*]Value, &a.inline_store) + 3;
+            a.elems_cap = objmod.inline_slots - 3;
+        } else {
+            try objmod.growElems(vm, a, n);
+        }
         @memcpy(a.elems[0..n], f.args[0..n]);
         a.elems_len = n;
     }
-    try props.addProp(vm, a, vm.k.length, Value.fromUsize(n), PropFlags.hidden);
-    try props.addProp(vm, a, PropKey.fromSymbol(vm.sym.iterator), vm.protos.array_values.value(), PropFlags.hidden);
-    if (!f.fp.strict) try props.addProp(vm, a, vm.k.callee, f.func.value(), PropFlags.hidden);
+    a.arr_len = n;
+    a.slots[0] = Value.fromUsize(n);
+    a.slots[1] = vm.protos.array_values.value();
+    if (!f.fp.strict) a.slots[2] = f.func.value();
     return a;
 }
 
@@ -103,7 +111,7 @@ fn setHome(vm: *Vm, fnv: Value, home: *Object) Error!void {
     }
 }
 
-fn defineMethod(vm: *Vm, target: *Object, key: PropKey, fnv: Value, flags: u8) Error!void {
+pub fn defineMethod(vm: *Vm, target: *Object, key: PropKey, fnv: Value, flags: u8) Error!void {
     const kind = flags & 3;
     const enumerable = flags & 4 != 0;
     try setHome(vm, fnv, target);
@@ -204,7 +212,7 @@ fn makeClass(vm: *Vm, f: *Frame, fp: *bc.FuncProto, has_parent: bool, parent: Va
     ctor.flags.class_ctor = true;
     ctor.flags.derived_ctor = fp.is_derived;
     const x = try vm.gpa.create(objmod.FnExtra);
-    x.* = .{ .home = proto };
+    x.* = .{ .home = proto, .inst_shape = try shape.rootFor(vm, proto) };
     ctor.host = x;
     try props.addProp(vm, ctor, vm.k.length, Value.fromUsize(fp.length), PropFlags.config_only);
     try props.addProp(vm, ctor, vm.k.name, Value.fromString(fp.name), PropFlags.config_only);
@@ -222,6 +230,24 @@ pub fn runFields(vm: *Vm, this: Value, func: Value) Error!void {
 
 pub fn copyDataProps(vm: *Vm, target: *Object, src: Value, excluded: []const Value) Error!void {
     if (src.isNullish()) return;
+    if (src.isObject()) {
+        const from = src.asObject();
+        if (from.shape.all_plain_str and !from.flags.exotic and !from.flags.lazy_fn and from.elems_len == 0 and from.class == .object) {
+            if (excluded.len == 0 and target.shape == vm.object_root and target.elems_len == 0 and !target.flags.is_proto and from.shape.proto == vm.protos.object) {
+                const n = from.shape.count;
+                if (n > target.slot_cap) try objmod.growSlots(vm, target, n);
+                @memcpy(target.slots[0..n], from.slots[0..n]);
+                target.shape = from.shape;
+                return;
+            }
+            if (excluded.len == 0) {
+                for (from.shape.entries(), 0..) |e, slot| {
+                    try props.defineData(vm, target, e.key, from.slots[slot], PropFlags.all);
+                }
+                return;
+            }
+        }
+    }
     const from = try conv.toObject(vm, src);
     const keys = try props.ownKeys(vm, from);
     defer vm.gpa.free(keys);
@@ -264,7 +290,7 @@ pub fn exec(vm: *Vm, f: *Frame, op: Op) Error!void {
         },
         .define_field => {
             const ic = &f.fp.ics[u32At(pc + 1)];
-            try props.defineData(vm, (sp - 2)[0].asObject(), ic.key, (sp - 1)[0], PropFlags.all);
+            try icache.defineField(vm, ic, (sp - 2)[0].asObject(), (sp - 1)[0]);
             vm.sp = sp - 1;
             f.pc = pc + 5;
         },

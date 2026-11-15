@@ -5,6 +5,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const style = @import("css/style.zig");
+const perf = @import("perf_rules.zig");
+const dom_flags = @import("dom_flags.zig");
 
 pub const Kind = enum { document, fragment, element, text, comment, doctype };
 pub const Ns = enum { html, svg, mathml };
@@ -22,6 +24,7 @@ pub const Node = struct {
     /// An element's name, lowercase ("div"); "" otherwise.
     tag: []const u8 = "",
     ns: Ns = .html,
+    html_tag: perf.HtmlTag = .other,
     attrs: std.ArrayList(Attr) = .empty,
     /// A text's or comment's characters, a doctype's name.
     data: []const u8 = "",
@@ -42,10 +45,19 @@ pub const Node = struct {
     css_vars: ?*const anyopaque = null,
     style_generation: u32 = 0,
 
-    /// `hasClass`'s filter, and the attribute text it is of.
+    /// `hasClass`'s filter, cached `id`/`class` slices, and single-class fast state (Theorem 35 & 44).
+    id_attr: ?[]const u8 = null,
+    class_attr: ?[]const u8 = null,
     class_filter: u64 = 0,
+    attr_filter: u64 = 0,
+    subtree_class_bloom: u64 = 0,
+    subtree_attr_bloom: u64 = 0,
+    ancestor_bloom: u64 = 0,
+    ancestor_hash: u64 = 0,
     class_src: [*]const u8 = "".ptr,
     class_src_len: usize = 0,
+    class_single: bool = false,
+    subtree_layout_dirty: bool = true,
 
     /// A shadow root's stand-in: an element whose parent is its host, though it
     /// is none of the host's children, so walks of the host's tree stay out of it.
@@ -74,13 +86,26 @@ pub const Node = struct {
     popover_open: bool = false,
     /// Showing by `showModal()`: `:modal`.
     modal: bool = false,
+    /// Upward-closed summary: this element or a descendant is a resource/sheet tag.
+    has_resource: bool = false,
+    has_id: bool = false,
+    has_insertion_work: bool = false,
+    has_on_attr: bool = false,
+    /// Queued in `Document.dirty_nodes` for the next `flushStyle` pass.
+    style_queued: bool = false,
+    has_js_listeners: bool = false,
+    children_gen: u32 = 0,
+    style_shared_gen: u32 = 0,
+    box_gen: u32 = 0,
+    style_canon: ?*const style.Style = null,
     /// An inline split around blocks: its boxes, whose union its rect is.
     box_parts: []const *anyopaque = &.{},
 
-    /// The node's JS object (`web/`), its listeners, its layout box.
     js_object: ?*anyopaque = null,
-    listeners: ?*anyopaque = null,
+    js_style: ?*anyopaque = null,
+    js_class_list: ?*anyopaque = null,
     box: ?*anyopaque = null,
+    text_cache: ?*anyopaque = null,
 
     /// A form control's live state: the value when edited (else the
     /// attribute's), its editor (`paint/controls.zig`), checked and selected.
@@ -94,75 +119,62 @@ pub const Node = struct {
     /// Its `srcset` candidate's density: file pixels to a CSS pixel.
     image_density: f32 = 1,
 
-    pub fn isElement(n: *const Node) bool {
-        return n.kind == .element;
+    pub fn isElement(n: *const Node) bool { return n.kind == .element; }
+    pub inline fn liveBox(n: *const Node) ?*anyopaque { return if (n.box_gen == n.doc.box_generation) n.box else null; }
+    pub inline fn liveBoxParts(n: *const Node) []const *anyopaque { return if (n.box_gen == n.doc.box_generation) n.box_parts else &.{}; }
+    pub inline fn setBox(n: *Node, b: ?*anyopaque) void { n.box = b; n.box_parts = &.{}; n.box_gen = n.doc.box_generation; }
+
+    pub inline fn isTag(n: *const Node, tag: []const u8) bool {
+        return n.kind == .element and n.tag.len == tag.len and (n.tag.len == 0 or (n.tag[0] == tag[0] and std.mem.eql(u8, n.tag, tag)));
     }
 
-    pub fn isTag(n: *const Node, tag: []const u8) bool {
-        return n.kind == .element and std.mem.eql(u8, n.tag, tag);
-    }
-
-    pub fn attr(n: *const Node, name: []const u8) ?[]const u8 {
-        for (n.attrs.items) |a| if (std.mem.eql(u8, a.name, name)) return a.value;
+    pub inline fn attr(n: *const Node, name: []const u8) ?[]const u8 {
+        if ((n.attr_filter & perf.attrBit(name)) == 0) return null;
+        if (name.len == 2 and name[0] == 'i' and name[1] == 'd') return n.id_attr;
+        if (name.len == 5 and name[0] == 'c' and std.mem.eql(u8, name, "class")) return n.class_attr;
+        for (n.attrs.items) |a| if (a.name.len == name.len and (name.len == 0 or (a.name[0] == name[0] and std.mem.eql(u8, a.name, name)))) return a.value;
         return null;
     }
 
-    pub fn hasAttr(n: *const Node, name: []const u8) bool {
-        return n.attr(name) != null;
-    }
+    pub fn hasAttr(n: *const Node, name: []const u8) bool { return n.attr(name) != null; }
 
     /// Sets an attribute; `name` and `value` are copied.
     pub fn setAttr(n: *Node, name: []const u8, value: []const u8) Allocator.Error!void {
         const gpa = n.doc.arena;
-        const v = try gpa.dupe(u8, value);
-        n.doc.touchAttr(n, name);
-        if (changesBoxes(n, name)) n.doc.touchLayout();
         for (n.attrs.items) |*a| if (std.mem.eql(u8, a.name, name)) {
-            a.value = v;
+            if (std.mem.eql(u8, a.value, value)) return;
+            a.value = try gpa.dupe(u8, value);
+            perf.syncNodeAttr(n, name, a.value);
+            dom_flags.markSubtreeLayoutDirty(n);
+            n.doc.touchAttr(n, name);
+            if (changesBoxes(n, name)) n.doc.touchNodeLayout(n);
             return;
         };
+        const v = try gpa.dupe(u8, value);
         try n.attrs.append(gpa, .{ .name = try gpa.dupe(u8, name), .value = v });
+        if (name.len > 2 and name[0] == 'o' and name[1] == 'n') n.has_on_attr = true;
+        perf.syncNodeAttr(n, name, v);
+        dom_flags.markSubtreeLayoutDirty(n);
+        n.doc.touchAttr(n, name);
+        if (changesBoxes(n, name)) n.doc.touchNodeLayout(n);
     }
 
     pub fn removeAttr(n: *Node, name: []const u8) void {
         for (n.attrs.items, 0..) |a, i| if (std.mem.eql(u8, a.name, name)) {
             _ = n.attrs.orderedRemove(i);
+            perf.syncNodeAttr(n, name, null);
+            dom_flags.markSubtreeLayoutDirty(n);
             n.doc.touchAttr(n, name);
-            if (changesBoxes(n, name)) n.doc.touchLayout();
+            if (changesBoxes(n, name)) n.doc.touchNodeLayout(n);
             return;
         };
     }
 
     /// An attribute that decides what boxes there are, with no style changing.
-    fn changesBoxes(n: *const Node, name: []const u8) bool {
-        return n.isTag("details") and std.mem.eql(u8, name, "open");
-    }
+    fn changesBoxes(n: *const Node, name: []const u8) bool { return n.isTag("details") and std.mem.eql(u8, name, "open"); }
 
-    fn classBit(name: []const u8) u64 {
-        const mix = @as(u32, name[0]) *% 31 +% @as(u32, name[name.len - 1]) *% 17 +% @as(u32, @truncate(name.len));
-        return @as(u64, 1) << @intCast(mix & 63);
-    }
-
-    /// Whether the `class` attribute lists `name`. Style matching asks this all
-    /// the time, and mostly the answer is no: each node keeps a little filter
-    /// of its classes, good until the attribute's text is replaced.
-    pub fn hasClass(n: *const Node, name: []const u8) bool {
-        const list = n.attr("class") orelse return false;
-        if (name.len == 0) return false;
-        if (n.class_src != list.ptr or n.class_src_len != list.len) {
-            var bits: u64 = 0;
-            var words = std.mem.tokenizeAny(u8, list, " \t\r\n\x0c");
-            while (words.next()) |w| bits |= classBit(w);
-            const self = @constCast(n);
-            self.class_src = list.ptr;
-            self.class_src_len = list.len;
-            self.class_filter = bits;
-        }
-        if (n.class_filter & classBit(name) == 0) return false;
-        var it = std.mem.tokenizeAny(u8, list, " \t\r\n\x0c");
-        while (it.next()) |c| if (std.mem.eql(u8, c, name)) return true;
-        return false;
-    }
+    /// Whether the `class` attribute lists `name` (Theorem 35).
+    pub fn hasClass(n: *const Node, name: []const u8) bool { return perf.hasNodeClass(n, name); }
 
     pub fn firstElementChild(n: *const Node) ?*Node {
         var c = n.first_child;
@@ -204,7 +216,33 @@ pub const Node = struct {
     /// when null). A fragment gives its children. `child` must not contain `n`.
     pub fn insertBefore(n: *Node, child: *Node, ref: ?*Node) void {
         if (child.kind == .fragment) {
-            while (child.first_child) |k| n.insertBefore(k, ref);
+            const first = child.first_child orelse return;
+            const last = child.last_child.?;
+            child.first_child = null;
+            child.last_child = null;
+            child.children_gen +%= 1;
+            n.children_gen +%= 1;
+            var has_res = n.isTag("style");
+            var has_id = false;
+            var has_work = false;
+            var sub_cls: u64 = 0;
+            var sub_att: u64 = 0;
+            var k: ?*Node = first;
+            while (k) |x| : (k = x.next) {
+                x.parent = n;
+                if (x.has_resource) has_res = true;
+                if (x.has_id) has_id = true;
+                if (x.has_insertion_work) has_work = true;
+                sub_cls |= x.subtree_class_bloom;
+                sub_att |= x.subtree_attr_bloom;
+            }
+            const prev = if (ref) |r| r.prev else n.last_child;
+            first.prev = prev;
+            last.next = ref;
+            if (prev) |p| p.next = first else n.first_child = first;
+            if (ref) |r| r.prev = last else n.last_child = last;
+            dom_flags.propagateInsert(n, has_res, has_id, has_work, sub_cls, sub_att);
+            dom_flags.touchTreeInsert(n.doc, n, first, last, has_id);
             return;
         }
         child.remove();
@@ -213,26 +251,61 @@ pub const Node = struct {
         child.prev = if (ref) |r| r.prev else n.last_child;
         if (child.prev) |p| p.next = child else n.first_child = child;
         if (ref) |r| r.prev = child else n.last_child = child;
-        n.doc.touchTree(n);
+        n.children_gen +%= 1;
+        dom_flags.propagateInsert(n, child.has_resource or n.isTag("style"), child.has_id, child.has_insertion_work, child.subtree_class_bloom, child.subtree_attr_bloom);
+        dom_flags.touchTreeInsert(n.doc, n, child, child, child.has_id);
     }
 
-    pub fn appendChild(n: *Node, child: *Node) void {
-        n.insertBefore(child, null);
+    pub fn appendChild(n: *Node, child: *Node) void { n.insertBefore(child, null); }
+
+    /// Links a freshly created node into `n` during parsing or cloning without `touchTree`.
+    pub fn parserInsert(n: *Node, child: *Node, ref: ?*Node) void {
+        child.parent = n;
+        child.next = ref;
+        child.prev = if (ref) |r| r.prev else n.last_child;
+        if (child.prev) |p| p.next = child else n.first_child = child;
+        if (ref) |r| r.prev = child else n.last_child = child;
+        n.children_gen +%= 1;
+        dom_flags.propagateInsert(n, child.has_resource or n.isTag("style"), child.has_id, child.has_insertion_work, child.subtree_class_bloom, child.subtree_attr_bloom);
     }
 
     /// Takes the node out of its parent.
     pub fn remove(n: *Node) void {
         const p = n.parent orelse return;
+        const prev_el = if (n.kind == .element) n.prevElement() else null;
+        const next_el = if (n.kind == .element) n.nextElement() else null;
         if (n.prev) |a| a.next = n.next else p.first_child = n.next;
         if (n.next) |b| b.prev = n.prev else p.last_child = n.prev;
         n.parent = null;
         n.prev = null;
         n.next = null;
-        n.doc.touchTree(p);
+        n.subtree_layout_dirty = true;
+        p.children_gen +%= 1;
+        dom_flags.markSubtreeLayoutDirty(p);
+        if (n.has_resource or p.isTag("style")) n.doc.scan_dirty = true;
+        dom_flags.touchTreeRemove(n.doc, p, n.kind == .element, prev_el, next_el, n.has_id);
     }
 
     pub fn removeChildren(n: *Node) void {
-        while (n.first_child) |c| c.remove();
+        var c = n.first_child orelse return;
+        n.first_child = null;
+        n.last_child = null;
+        n.children_gen +%= 1;
+        dom_flags.markSubtreeLayoutDirty(n);
+        var scan = n.isTag("style");
+        var had_id = false;
+        while (true) {
+            const next = c.next;
+            if (c.has_resource) scan = true;
+            if (c.has_id) had_id = true;
+            c.parent = null;
+            c.prev = null;
+            c.next = null;
+            c.subtree_layout_dirty = true;
+            c = next orelse break;
+        }
+        if (scan) n.doc.scan_dirty = true;
+        dom_flags.touchTreeClear(n.doc, n, had_id);
     }
 
     /// The next node in document order; stays inside `root`.
@@ -284,7 +357,8 @@ pub const Node = struct {
         root.shadow_declarative = declarative;
         root.parent = n;
         n.shadow_root = root;
-        n.doc.touchTree(n);
+        dom_flags.markSubtreeLayoutDirty(n);
+        n.doc.touchTree(n, false);
         return root;
     }
 
@@ -316,8 +390,20 @@ pub const Node = struct {
 
     /// Sets a text's characters; `s` is copied.
     pub fn setData(n: *Node, s: []const u8) Allocator.Error!void {
+        if (std.mem.eql(u8, n.data, s)) return;
         n.data = try n.doc.arena.dupe(u8, s);
-        n.doc.touchLayout();
+        if (n.parent) |p| {
+            if (p.isTag("style")) {
+                n.doc.scan_dirty = true;
+                n.doc.markStyle(p);
+            }
+            if (p.ns == .svg) {
+                n.doc.svg_version +%= 1;
+                n.doc.svg_dirty = true;
+                return;
+            }
+        }
+        n.doc.touchNodeLayout(n);
     }
 };
 
@@ -330,6 +416,7 @@ pub const Document = struct {
     /// Style must be computed again; layout too, which that implies.
     style_dirty: bool = true,
     layout_dirty: bool = true,
+    scan_dirty: bool = true,
     /// What `:hover`, `:active` and `:focus` match; setting them restyles.
     hover: ?*Node = null,
     active: ?*Node = null,
@@ -338,13 +425,33 @@ pub const Document = struct {
     quirks: bool = false,
     /// Goes up as style is touched: what live collections know themselves by.
     generation: u32 = 0,
-    /// Goes up when anything in an inline `<svg>` changes: what's drawn from
-    /// their markup is made again (`paint/svg_markup.zig`).
+    /// Goes up when non-SVG-interior tree structure changes (outermost `<svg>` roots).
+    svg_roots_generation: u32 = 0,
+    box_generation: u32 = 1,
+    layout_cache_gen: u32 = 1,
+    /// Goes up when tree structure or an `id` attribute changes (Theorem 16).
+    id_generation: u32 = 1,
+    id_map_gen: u32 = 0,
+    id_last_gen: u32 = 0,
+    id_has_dups: bool = false,
+    id_last_key: []const u8 = "",
+    id_last_node: ?*Node = null,
+    id_map: std.StringHashMapUnmanaged(*Node) = .empty,
+    /// Per-document 128-slot parsed selector cache (Theorem 70).
+    sel_cache_keys: [128][]const u8 = @splat(""),
+    sel_cache_ptrs: [128]?*const anyopaque = @splat(null),
+    sel_cache_lens: [128]u32 = @splat(0),
     svg_version: u32 = 0,
+    svg_style_version: u32 = 0,
+    font_epoch: u32 = 0,
     svg_dirty: bool = false,
+    rule_flags: u8 = 0x7f,
+    rule_attr_filter: u64 = std.math.maxInt(u64),
+    rule_id_bloom: u64 = std.math.maxInt(u64),
     /// What a restyle has to look at: everything, or under just these.
     dirty_all: bool = true,
     dirty_nodes: std.ArrayList(*Node) = .empty,
+    oof_dirty_node: ?*Node = null,
     /// What `showModal()` and `showPopover()` have raised, the oldest first.
     top_layer: std.ArrayList(*Node) = .empty,
 
@@ -356,91 +463,87 @@ pub const Document = struct {
         return d;
     }
 
+    pub inline fn invalidateLayoutCache(d: *Document) void {
+        d.layout_cache_gen +%= 1;
+        if (d.layout_cache_gen == 0) d.layout_cache_gen = 1;
+    }
+
     /// Everything's style may have changed.
     pub fn touchStyle(d: *Document) void {
         d.generation +%= 1;
+        d.svg_roots_generation +%= 1;
         d.style_dirty = true;
         d.layout_dirty = true;
+        d.oof_dirty_node = null;
         d.dirty_all = true;
+        d.invalidateLayoutCache();
     }
 
-    fn inDocument(d: *const Document, n: *const Node) bool {
+    pub fn inDocument(d: *const Document, n: *const Node) bool {
         var at: ?*const Node = n;
         while (at) |x| : (at = x.parent) if (x == d.node) return true;
         return false;
     }
 
     /// `n` and what's under it restyle.
-    pub fn markStyle(d: *Document, n: *Node) void {
-        d.touchUnder(n);
-    }
+    pub fn markStyle(d: *Document, n: *Node) void { d.touchUnder(n); }
 
     /// The style of what's under `n` may have changed: only that restyles.
-    fn touchUnder(d: *Document, n: *Node) void {
-        d.style_dirty = true;
-        if (d.dirty_all) return;
-        if (d.dirty_nodes.items.len >= 256) {
-            d.dirty_all = true;
-            return;
-        }
-        d.dirty_nodes.append(d.arena, n) catch {
-            d.dirty_all = true;
-        };
-    }
+    pub fn touchUnder(d: *Document, n: *Node) void { perf.touchUnder(d, n); }
 
     /// An attribute of `n` changed. Layout follows only if style did. What
     /// selects by it reaches its siblings at most, unless it is the inline style.
-    fn touchAttr(d: *Document, n: *Node, name: []const u8) void {
-        d.generation +%= 1;
-        if (!d.inDocument(n)) return;
-        d.touchUnder(if (std.mem.eql(u8, name, "style")) n else n.parent orelse n);
-    }
+    fn touchAttr(d: *Document, n: *Node, name: []const u8) void { perf.touchAttr(d, n, name); }
 
     /// `n`'s children changed.
-    fn touchTree(d: *Document, n: *Node) void {
+    fn touchTree(d: *Document, n: *Node, id_changed: bool) void {
         d.generation +%= 1;
         if (!d.inDocument(n)) return;
-        d.layout_dirty = true;
+        if (id_changed) d.id_generation +%= 1;
+        const disp_contents = n.computed != null and n.computed.?.display == .contents;
+        if (!perf.isSvgInterior(n.ns == .svg, false, disp_contents)) {
+            d.layout_dirty = true;
+            d.oof_dirty_node = null;
+            d.svg_roots_generation +%= 1;
+        }
         d.touchUnder(n);
     }
 
     /// The top modal dialog: what's outside it takes no input.
     pub fn modalDialog(d: *const Document) ?*Node {
         var i = d.top_layer.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (d.top_layer.items[i].modal) return d.top_layer.items[i];
-        }
+        while (i > 0) { i -= 1; if (d.top_layer.items[i].modal) return d.top_layer.items[i]; }
         return null;
     }
 
     /// Raises `n`, or lowers it when `up` is false.
     pub fn setTopLayer(d: *Document, n: *Node, up: bool) void {
-        for (d.top_layer.items, 0..) |x, i| if (x == n) {
-            _ = d.top_layer.orderedRemove(i);
-            break;
-        };
+        for (d.top_layer.items, 0..) |x, i| if (x == n) { _ = d.top_layer.orderedRemove(i); break; };
         n.in_top_layer = up;
-        if (up) d.top_layer.append(d.arena, n) catch {
-            n.in_top_layer = false;
-        };
+        if (up) d.top_layer.append(d.arena, n) catch { n.in_top_layer = false; };
         d.touchStyle();
     }
 
     pub fn touchLayout(d: *Document) void {
         d.layout_dirty = true;
+        d.oof_dirty_node = null;
+        d.invalidateLayoutCache();
     }
 
-    pub fn createElement(d: *Document, tag: []const u8) Allocator.Error!*Node {
-        return d.createElementNs(tag, .html);
+    pub fn touchNodeLayout(d: *Document, n: *Node) void {
+        d.layout_dirty = true;
+        d.oof_dirty_node = null;
+        dom_flags.markSubtreeLayoutDirty(n);
     }
+
+    pub fn createElement(d: *Document, tag: []const u8) Allocator.Error!*Node { return d.createElementNs(tag, .html); }
 
     /// `tag` is copied, lowercased unless the namespace keeps case (SVG).
     pub fn createElementNs(d: *Document, tag: []const u8, ns: Ns) Allocator.Error!*Node {
         const n = try d.arena.create(Node);
         const name = try d.arena.dupe(u8, tag);
         if (ns == .html) _ = std.ascii.lowerString(name, name);
-        n.* = .{ .kind = .element, .doc = d, .tag = name, .ns = ns };
+        n.* = .{ .kind = .element, .doc = d, .tag = name, .ns = ns, .html_tag = if (ns == .html) perf.classifyHtmlTag(name) else .other, .has_resource = perf.isResourceTag(name), .has_insertion_work = perf.isInsertionWorkTag(name) };
         return n;
     }
 
@@ -462,9 +565,7 @@ pub const Document = struct {
         return n;
     }
 
-    pub fn documentElement(d: *const Document) ?*Node {
-        return d.node.firstElementChild();
-    }
+    pub fn documentElement(d: *const Document) ?*Node { return d.node.firstElementChild(); }
 
     fn childOfRoot(d: *const Document, tag: []const u8) ?*Node {
         const root = d.documentElement() orelse return null;
@@ -473,21 +574,9 @@ pub const Document = struct {
         return null;
     }
 
-    pub fn head(d: *const Document) ?*Node {
-        return d.childOfRoot("head");
-    }
-
-    pub fn body(d: *const Document) ?*Node {
-        return d.childOfRoot("body") orelse d.childOfRoot("frameset");
-    }
-
-    pub fn getElementById(d: *const Document, id: []const u8) ?*Node {
-        var at = d.node.first_child;
-        while (at) |n| : (at = n.nextInTree(d.node)) {
-            if (n.kind == .element) if (n.attr("id")) |v| if (std.mem.eql(u8, v, id)) return n;
-        }
-        return null;
-    }
+    pub fn head(d: *const Document) ?*Node { return d.childOfRoot("head"); }
+    pub fn body(d: *const Document) ?*Node { return d.childOfRoot("body") orelse d.childOfRoot("frameset"); }
+    pub fn getElementById(d: *const Document, id: []const u8) ?*Node { return perf.getElementById(d, id); }
 
     /// The first `<title>`'s text, whitespace collapsed by the caller.
     pub fn title(d: *const Document, gpa: Allocator) Allocator.Error![]const u8 {
@@ -499,24 +588,6 @@ pub const Document = struct {
     }
 };
 
-test "tree edits keep their links" {
-    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer a.deinit();
-    const d = try Document.create(a.allocator());
-    const p = try d.createElement("DIV");
-    try std.testing.expectEqualStrings("div", p.tag);
-    d.node.appendChild(p);
-    const x = try d.createText("x");
-    const y = try d.createText("y");
-    p.appendChild(y);
-    p.insertBefore(x, y);
-    try std.testing.expectEqualStrings("xy", try p.textContent(a.allocator()));
-    x.remove();
-    try std.testing.expect(p.first_child == y and y.prev == null);
-    const f = try d.createFragment();
-    f.appendChild(x);
-    p.appendChild(f);
-    try std.testing.expect(p.last_child == x and f.first_child == null);
-    try p.setAttr("id", "me");
-    try std.testing.expect(d.getElementById("me") == p);
+test {
+    _ = dom_flags;
 }

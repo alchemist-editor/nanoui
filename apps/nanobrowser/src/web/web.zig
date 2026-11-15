@@ -12,6 +12,7 @@ const world_mod = @import("world.zig");
 const bind = @import("bind.zig");
 const scripts = @import("scripts.zig");
 const page_input = @import("../page_input.zig");
+const loader = @import("../loader.zig");
 const Value = js.Value;
 
 pub const World = world_mod.World;
@@ -161,6 +162,7 @@ pub fn animationEvents(p: *Page) void {
 pub fn frameStart(p: *Page) void {
     const w = p.js orelse return;
     w.redraw_asked = false;
+    w.redraw_due = false;
     w.in_frame = true;
     if (w.blur_request) {
         w.blur_request = false;
@@ -236,10 +238,14 @@ pub fn paintEnd(p: *Page) void {
 
 /// The frame is over, however it ended: another if something still waits for one.
 pub fn frameEnd(p: *Page, c: *ui.Context) void {
+    for (p.frames.list.items) |f| {
+        if (f.page) |child| if (child.js) |cw| if (cw.in_frame) frameEnd(child, c);
+    }
     const w = p.js orelse return;
     w.painting = false;
     if (!p.dead and (w.animation.items.len > 0 or w.redraw_due)) c.animationFrame();
     w.redraw_due = false;
+    w.redraw_asked = false;
     w.in_frame = false;
 }
 
@@ -349,7 +355,14 @@ pub fn setFocus(p: *Page, node: ?*dom.Node) void {
     const old = p.doc.focus;
     if (old == node) return;
     p.doc.focus = node;
-    p.doc.touchStyle();
+    if (p.doc.scan_dirty) loader.scan(p);
+    if (!p.doc.dirty_all) {
+        for ([_]?*dom.Node{ old, node }) |maybe| {
+            const n = maybe orelse continue;
+            const top = p.engine.invalidatedByState(n, .focus) orelse n;
+            p.doc.markStyle(top);
+        }
+    }
     const w = p.js orelse return;
     w.changed();
     w.blur_request = true;
