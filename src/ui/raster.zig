@@ -117,6 +117,7 @@ const Band = struct {
 
     /// Draws the region's rows, shared among threads when there are many.
     fn share(job: Band) void {
+        if (@import("builtin").single_threaded) return job.rows(job.region[1], job.region[3]);
         const height = job.region[3] - job.region[1];
         const cpus = std.Thread.getCpuCount() catch 1;
         const n = @max(1, @min(threads, thread_limit, cpus, height * (job.region[2] - job.region[0]) / min_pixels));
@@ -322,7 +323,7 @@ fn bounds(out: gpu.Pixels, i: *const gpu.Instance, scale: f32) ?[4]usize {
     return .{ @intFromFloat(px0), @intFromFloat(py0), @intFromFloat(px1), @intFromFloat(py1) };
 }
 
-fn drawOne(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, region: [4]usize) void {
+pub fn drawOne(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, region: [4]usize) void {
     if (i.kind == gpu.Kind.layer_begin or i.kind == gpu.Kind.layer_end or i.kind == gpu.Kind.layer_composite) return;
     const all = bounds(out, i, scale) orelse return;
     const b: [4]usize = .{ @max(all[0], region[0]), @max(all[1], region[1]), @min(all[2], region[2]), @min(all[3], region[3]) };

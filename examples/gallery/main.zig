@@ -5,6 +5,9 @@ const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const phone = @import("phone.zig");
+const web = @import("builtin").os.tag == .wasi;
+const PlatformApp = if (web) void else nanoui.App;
+const PlatformWindow = if (web) void else nanoui.Window;
 
 const Item = struct { title: [64]u8, len: usize, done: bool };
 
@@ -59,17 +62,16 @@ const Gallery = struct {
     motion: @import("motion.zig").Demo = .{},
     kit: @import("kit.zig").Demo = .{},
     glass: @import("glass.zig").Demo = .{},
-    typography: @import("typography.zig").Demo = .{},
     /// The app, so a page can make a window of its own: the Windows page does,
     /// because a borderless or translucent window is the only way to see what
     /// those options do.
-    app: ?*nanoui.App = null,
+    app: ?*PlatformApp = null,
     /// The gallery's own window, so the demo window can be placed beside it
     /// rather than over the controls that change it.
-    window: ?*nanoui.Window = null,
+    window: ?*PlatformWindow = null,
     /// The window the Windows page made, if it is open: one at a time, and the
     /// opacity slider writes to it.
-    demo_window: ?*nanoui.Window = null,
+    demo_window: ?*PlatformWindow = null,
     /// The demo window's options, as the page's controls set them. A slider is
     /// `f32` and a window's opacity is `f64`, so this is the slider's type and
     /// the window reads it converted.
@@ -120,47 +122,38 @@ const Gallery = struct {
         switch (g.page) {
             0 => g.controls(c),
             1 => g.tasks(c),
-            2 => g.typography.view(c),
+            2 => g.typography(c),
             else => g.bigList(c),
         }
     }
 
     fn sidebar(g: *Gallery, c: *ui.Context) void {
         const th = c.theme;
-        c.title_bar_height = 40;
         ui.column(c, .{
             .width = .{ .px = 200 },
             .height = .fill,
             .padding = .{ .top = 44, .left = 12, .right = 12, .bottom = 12 },
             .gap = 4,
-            .clip = true,
             .background = th.surface.alpha(0.6),
             .border = th.border,
             .border_width = 0,
         });
         defer ui.end(c);
-        {
-            const head = ui.div(c).column().px(2).gap(4);
-            defer head.end();
-            ui.text(c, "nanoui", .{ .size = 18, .weight = .bold });
-            ui.label(c, c.print("Zig 0.17 · {s}", .{c.renderer}));
-        }
+        ui.text(c, "nanoui", .{ .size = 18, .weight = .bold });
+        ui.label(c, c.print("Zig 0.17 · {s}", .{c.renderer}));
         _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
-        {
-            const nav = ui.div(c).column().wFull().grow().gap(4).scrollY().scrollEdgeFade(12).scrollBarIdle(3.0);
-            defer nav.end();
-            for (phone.pages, 0..) |p, i| {
-                const selected = g.page == i;
-                // GPUI's way: a box styled by a chain of methods.
-                var item = ui.div(c).row().wFull().px(10).py(7).gap(8).itemsCenter().rounded(7);
-                item = if (selected) item.bg(th.accent) else item.hover(th.surface_hover);
-                defer item.end();
-                if (item.clicked()) g.page = i;
-                const fg = if (selected) th.accent_text else th.text;
-                ui.icon(c, p[1], .{ .size = 14, .frame = 18, .color = fg });
-                ui.text(c, p[0], .{ .weight = .medium, .color = fg });
-            }
+        for (phone.pages, 0..) |p, i| {
+            const selected = g.page == i;
+            // GPUI's way: a box styled by a chain of methods.
+            var item = ui.div(c).row().wFull().px(10).py(7).gap(8).itemsCenter().rounded(7);
+            item = if (selected) item.bg(th.accent) else item.hover(th.surface_hover);
+            defer item.end();
+            if (item.clicked()) g.page = i;
+            const fg = if (selected) th.accent_text else th.text;
+            ui.icon(c, p[1], .{ .size = 14, .frame = 18, .color = fg });
+            ui.text(c, p[0], .{ .weight = .medium, .color = fg });
         }
+        ui.spacer(c);
         ui.label(c, c.print("{d} frames", .{c.frame}));
         ui.label(c, c.print("{d:.0} fps", .{g.fps}));
     }
@@ -361,6 +354,10 @@ const Gallery = struct {
     /// The Windows page's whole body, in the same scrolling column the other
     /// pages use: the three cards stack, they do not sit side by side.
     fn windowsContent(g: *Gallery, c: *ui.Context) void {
+        if (comptime web) {
+            ui.text(c, "Native windows are unavailable in this canvas demo.", .{});
+            return;
+        }
         ui.scroll(c, .{ .grow = 1, .width = .fill, .height = .fill, .padding = .all(if (phone.compact(c)) 24 else 28), .gap = 20 });
         defer ui.end(c);
         g.windowsPage(c);
@@ -503,7 +500,6 @@ const Gallery = struct {
     /// `window_drag` handle — only when borderless, because a decorated window
     /// already moves by its own title bar and would be moved twice.
     fn demoView(g: *Gallery, c: *ui.Context) void {
-        if (!g.demo_borderless) c.title_bar_height = 38;
         ui.column(c, .{ .padding = .all(16), .gap = 10, .width = .fill, .height = .fill });
         defer ui.end(c);
         const drag = ui.div(c).row().wFull().itemsCenter().h(24);
@@ -519,17 +515,49 @@ const Gallery = struct {
         ui.text(c, if (g.demo_skip_taskbar) "Out of the taskbar and Alt-Tab." else "In the taskbar and Alt-Tab.", .{});
         ui.textf(c, .{ .color = c.theme.muted }, "opacity {d:.0}%", .{g.demo_opacity * 100});
     }
+
+    fn typography(_: *Gallery, c: *ui.Context) void {
+        ui.heading(c, "Typography");
+        ui.card(c, .{ .width = .fill, .gap = 10, .max_width = 640 });
+        defer ui.end(c);
+        ui.text(c, "Large Title", .{ .size = 30, .weight = .bold });
+        ui.text(c, "Title, semibold", .{ .size = 20, .weight = .semibold });
+        ui.text(c, "Body text in the system font, at 14 points.", .{});
+        ui.text(c, "const mono = \"monospaced, for code\";", .{ .mono = true, .size = 13 });
+        ui.text(c, "Unicode: naïve café — 日本語 — Ελληνικά — ✓ ★ →", .{});
+        ui.divider(c);
+        ui.text(c, "Text wraps to the width its box gets. Resize the window to watch these lines break " ++
+            "again: layout runs every frame, measured with CoreText, and each line is rasterized once into a " ++
+            "glyph atlas at the display's scale, then drawn as textured quads by one instanced Metal draw " ++
+            "call together with every rectangle, border and shadow on screen.", .{ .wrap = true, .color = c.theme.muted });
+    }
 };
 
+var web_gallery: ?*Gallery = null;
+export fn gallery_page(page: u32) void {
+    if (comptime web) {
+        if (web_gallery) |g| {
+            g.page = @min(page, 7);
+            if (nanoui.web.active) |surface| surface.requestFrame();
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
-    const app = try nanoui.App.create(init, .{ .name = "Gallery" });
-    defer app.destroy();
     var g: Gallery = .{};
-    g.app = app;
     g.add("Write a UI toolkit in Zig");
     g.add("Draw it with Metal");
     g.add("Ship it");
     g.items[1].done = true;
+    if (comptime web) {
+        web_gallery = &g;
+        _ = nanoui.web.registerBundledFonts();
+        _ = try nanoui.web.mount(.init(&g, Gallery.view), .{ .width = 900, .height = 640 });
+        nanoui.web.run();
+    }
+    const app = try nanoui.App.create(init, .{ .name = "Gallery" });
+    defer app.destroy();
+    g.app = app;
     const win = try app.newWindow(.{
         .title = "Gallery",
         .width = 900,
