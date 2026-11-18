@@ -45,6 +45,14 @@ export fn nanoui_web_pointer(kind: u32, x: f32, y: f32, button: u32, mods: u32, 
     s.requestFrame();
 }
 
+/// The pen of the pointer event that follows (`nanoui_web_pointer`):
+/// `is_pen` 0 for a mouse or a finger, which clears it. `buttons` is the
+/// `PointerEvent`'s; the rest are its fields as the browser reports them.
+export fn nanoui_web_pen(is_pen: u32, pressure: f32, tangential: f32, tilt_x: f32, tilt_y: f32, twist: f32, buttons: u32) void {
+    const s = web.active orelse return;
+    s.ctx.input.pen = if (is_pen == 0) null else @import("../ui/pen.zig").fromWeb(pressure, tangential, tilt_x, tilt_y, twist, buttons);
+}
+
 export fn nanoui_web_pinch(x: f32, y: f32, scale: f32, dx: f32, dy: f32) void {
     const s = web.active orelse return;
     if (!(scale > 0) or !@import("std").math.isFinite(scale)) return;
