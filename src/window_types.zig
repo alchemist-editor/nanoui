@@ -37,6 +37,21 @@ pub const PageOptions = struct {
     /// process pool, data store, extra script handlers.
     configure: ?*const fn (ctx: ?*anyopaque, config: *anyopaque) void = null,
     configure_ctx: ?*anyopaque = null,
+    /// Nothing the page stores outlives it: no cookies, storage or cache
+    /// kept, or shared with the app's other pages. macOS: a non-persistent
+    /// `WKWebsiteDataStore` (set before `configure`, which may change it);
+    /// Windows: an InPrivate controller (a runtime without
+    /// `ICoreWebView2Environment10` makes none, and the page stays blank).
+    private: bool = false,
+    /// Asked before every request that is not for the app's own assets,
+    /// from any frame (a sandboxed iframe's too): false answers it with a
+    /// 403, so it never leaves the machine. Windows, through WebView2's
+    /// `WebResourceRequested`, which is raised for no WebSocket; a runtime
+    /// without `ICoreWebView2_22` (filters for every frame) does not load
+    /// the page. macOS has no per-request hook: give the configuration a
+    /// `WKContentRuleList` from `configure` instead.
+    allow_request: ?*const fn (ctx: ?*anyopaque, url: []const u8) bool = null,
+    allow_request_ctx: ?*anyopaque = null,
 };
 
 /// One entry of `PageOptions.pages`.
