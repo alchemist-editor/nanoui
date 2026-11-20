@@ -25,7 +25,10 @@ export function createHost(canvas, options = {}) {
           const event = inputEvents.shift();
           if (event[0] === "pinch") runtime.exports.nanoui_web_pinch(...event.slice(1));
           else if (event[0] === "key") runtime.exports.nanoui_web_key(...event.slice(1));
-          else runtime.exports.nanoui_web_pointer(...event);
+          else {
+            runtime.exports.nanoui_web_pen?.(...(event[6] ?? noPen));
+            runtime.exports.nanoui_web_pointer(...event.slice(0, 6));
+          }
           if (event[0] !== 0 && !(event[0] === "key" && event[1] === 3)) break;
         }
         const submitted = runtime.gpu.stats.frames;
@@ -52,9 +55,12 @@ export function createHost(canvas, options = {}) {
     if (canvas.height !== height) canvas.height = height;
     runtime.exports.nanoui_web_resize(width, height, scale);
   }
-  function pointer(kind, x, y, button = 0, mods = 0, clicks = 1) {
+  // [is_pen, pressure, tangentialPressure, tiltX, tiltY, twist, buttons]
+  // for nanoui_web_pen; a mouse's or a finger's clears the pen.
+  const noPen = [0, 0, 0, 0, 0, 0, 0];
+  function pointer(kind, x, y, button = 0, mods = 0, clicks = 1, pen = noPen) {
     if (stopped || lost) return;
-    const event=[kind,x,y,button,mods,clicks];
+    const event=[kind,x,y,button,mods,clicks,pen];
     if(kind===0 && inputEvents.at(-1)?.[0]===0)inputEvents[inputEvents.length-1]=event;
     else inputEvents.push(event);
     request();
@@ -158,7 +164,8 @@ export function createHost(canvas, options = {}) {
                 if (kind === 2 && pressed && near(pressed, x, y)) lastClick = { ...pressed, time: e.timeStamp };
                 pressed = null;
               }
-              pointer(kind, x, y, e.button, mods, pressed?.clicks ?? 1);
+              const pen = e.pointerType === "pen" ? [1, e.pressure, e.tangentialPressure ?? 0, e.tiltX ?? 0, e.tiltY ?? 0, e.twist ?? 0, e.buttons] : noPen;
+              pointer(kind, x, y, e.button, mods, pressed?.clicks ?? 1, pen);
             }
             if (kind === 2 || kind === 3) { if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId); }
             e.preventDefault();
