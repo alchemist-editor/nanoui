@@ -348,7 +348,7 @@ pub const Db = struct {
         if (len < 12 or len > 256 << 20) return;
         // Untouched pages of an anonymous mapping cost nothing: the
         // tables read land at their offsets, the rest stays unread.
-        const data = std.heap.page_allocator.alloc(u8, len) catch return;
+        const data = std.heap.page_allocator.alloc(u8, @intCast(len)) catch return;
         defer std.heap.page_allocator.free(data);
         _ = file.readPositionalAll(db.io, data[0..@min(len, 64 * 1024)], 0) catch return;
         for (0..font.faces(data)) |i| {
